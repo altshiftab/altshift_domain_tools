@@ -25,6 +25,28 @@ same shape, and hold the source clients they use.
 The three halves answer different questions and share no sources but HackerTarget, which serves two
 of them through different endpoints. None finds what the others do.
 
+## Command
+
+```
+go install github.com/altshiftab/altshift_domain_tools/cmd/altshift_domain_tools@latest
+```
+
+```
+altshift_domain_tools subdomains [-b] [-r ADDRESS] [-c N] [-j] DOMAIN
+altshift_domain_tools related    [-w PATH] [-t PATH] [-H] [-j] DOMAIN
+altshift_domain_tools ranges     [-j] DOMAIN
+```
+
+One item per line by default, so a run pipes into whatever comes next the way the shell scripts this
+replaces did; `--json` adds how each result was found and what that is worth.
+
+`ranges` needs no credentials at all. `related` reads its keys from a file (`-w`, `-t`) or from
+`WHOISXML_API_KEY` and `HACKERTARGET_API_KEY` -- there is deliberately no flag taking a key itself,
+because an argument is visible in the process table to every user on the machine.
+
+The wordlist pass is opt-in (`-b`): it is visible in the target's resolver logs, so a run that did
+not ask for it does not do it.
+
 ## Subdomains
 
 ```go
