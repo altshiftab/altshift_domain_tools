@@ -1,6 +1,7 @@
 package finder
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net"
@@ -15,8 +16,14 @@ import (
 	"github.com/altshiftab/altshift_domain_tools/pkg/inference"
 	"github.com/altshiftab/altshift_domain_tools/pkg/network_range/finder/finder_config"
 	"github.com/altshiftab/altshift_domain_tools/pkg/network_range/spf"
+	"github.com/altshiftab/altshift_domain_tools/pkg/sources/arin"
+	"github.com/altshiftab/altshift_domain_tools/pkg/sources/arin/arin_config"
+	"github.com/altshiftab/altshift_domain_tools/pkg/sources/rdap"
+	"github.com/altshiftab/altshift_domain_tools/pkg/sources/rdap/rdap_config"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripe"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripe/ripe_config"
+	"github.com/altshiftab/altshift_domain_tools/pkg/sources/whois"
+	"github.com/altshiftab/altshift_domain_tools/pkg/sources/whois/whois_config"
 	"github.com/altshiftab/utils_go/pkg/http/types/fetch_config"
 )
 
@@ -38,7 +45,12 @@ func (stub *stubResolver) LookupTXT(_ context.Context, name string) ([]string, e
 	return records, nil
 }
 
-// newFinder stands the registry up on a test server and gives the walk a stubbed resolver.
+// newFinder stands the registries up on a test server and gives the walk a stubbed resolver.
+//
+// Both are pointed at the server rather than only the one a test is about: a client the finder
+// builds for itself talks to the live database, so leaving one unset would have every run of the
+// test suite query a registry that asks callers to be gentle -- and answer from whatever that
+// registry happens to hold for the domain the test made up.
 func newFinder(t *testing.T, handler http.HandlerFunc, records map[string][]string) *Finder {
 	t.Helper()
 
@@ -55,16 +67,83 @@ func newFinder(t *testing.T, handler http.HandlerFunc, records map[string][]stri
 			ripe_config.WithBaseUrl(serverUrl),
 			ripe_config.WithFetchOptions(fetch_config.WithHttpClient(server.Client())),
 		)),
+		finder_config.WithArin(arin.NewClient(
+			arin_config.WithBaseUrl(serverUrl),
+			arin_config.WithFetchOptions(fetch_config.WithHttpClient(server.Client())),
+		)),
+		// Supplying one confines the run to what was supplied, which is what keeps the registries
+		// this test is not about off the network entirely.
+		finder_config.WithRdap(MethodApnic, rdap.NewClient(
+			rdap_config.WithBaseUrl(serverUrl),
+			rdap_config.WithFetchOptions(fetch_config.WithHttpClient(server.Client())),
+		)),
 		finder_config.WithResolver(&stubResolver{records: records}),
 	)
 }
 
-// registryHandler answers both registry steps: the person search, then the ranges.
+// whoisServer stands a whois service up on a port of the operating system's choosing, and answers
+// the two queries the abuse mailbox route makes.
+func whoisServer(t *testing.T, answer func(query string) string) *whois.Client {
+	t.Helper()
+
+	listenConfig := &net.ListenConfig{}
+
+	listener, err := listenConfig.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("could not listen: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+
+	go func() {
+		for {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			go func() {
+				defer func() {
+					_ = connection.Close()
+				}()
+
+				query, err := bufio.NewReader(connection).ReadString('\n')
+				if err != nil {
+					return
+				}
+
+				_, _ = connection.Write([]byte(answer(strings.TrimRight(query, "\r\n"))))
+			}()
+		}
+	}()
+
+	host, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("could not split the address: %v", err)
+	}
+
+	return whois.NewClient(host, whois_config.WithPort(port))
+}
+
+// registryHandler answers both RIPE steps: the person search, then the ranges. ARIN is answered
+// with nothing, so that a test about the one registry is about the one registry.
 func registryHandler(t *testing.T, inetnum string) http.HandlerFunc {
 	t.Helper()
 
 	return func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
+
+		// ARIN's paths all begin here, and a search that matched nothing is a 404 rather than an
+		// empty result. The RDAP paths are answered the same way, so that a test about the one
+		// registry is about the one registry.
+		if strings.HasPrefix(request.URL.Path, "/rest/") ||
+			strings.HasPrefix(request.URL.Path, "/entities") ||
+			strings.HasPrefix(request.URL.Path, "/entity/") {
+			writer.WriteHeader(http.StatusNotFound)
+
+			return
+		}
 
 		if strings.Contains(request.URL.Path, "fulltextsearch") {
 			body := `{"result":{"numFound":1,"docs":[{"doc":{"strs":[
@@ -85,6 +164,55 @@ func registryHandler(t *testing.T, inetnum string) http.HandlerFunc {
 		]}}]}}`, inetnum)
 		if _, err := fmt.Fprint(writer, body); err != nil {
 			t.Errorf("could not write: %v", err)
+		}
+	}
+}
+
+// registriesHandler answers both registries from one server, so that a test can say what each of
+// them holds. The ARIN walk is four requests to RIPE's two, which is what the switch is.
+func registriesHandler(t *testing.T, inetnum string, first string, last string) http.HandlerFunc {
+	t.Helper()
+
+	write := func(writer http.ResponseWriter, body string) {
+		writer.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprint(writer, body); err != nil {
+			t.Errorf("could not write: %v", err)
+		}
+	}
+
+	return func(writer http.ResponseWriter, request *http.Request) {
+		path := request.URL.Path
+
+		switch {
+		case strings.Contains(path, "fulltextsearch"):
+			write(writer, `{"result":{"docs":[{"doc":{"strs":[
+				{"str":{"name":"nic-hdl","value":"AA1-RIPE"}},
+				{"str":{"name":"e-mail","value":"ops@example.com"}}
+			]}}]}}`)
+		case strings.HasPrefix(path, "/rest/pocs;"):
+			write(writer, `{"pocs":{"pocRef":{"@handle":"OPS1-ARIN"}}}`)
+		case strings.HasPrefix(path, "/rest/poc/"):
+			write(writer, `{"poc":{"handle":{"$":"OPS1-ARIN"},"companyName":{"$":"Example, Inc."},
+				"emails":{"email":{"$":"ops@example.com"}}}}`)
+		case strings.HasPrefix(path, "/entities"), strings.HasPrefix(path, "/entity/"):
+			writer.WriteHeader(http.StatusNotFound)
+		case strings.HasPrefix(path, "/rest/orgs;"):
+			write(writer, `{"orgs":{"orgRef":{"@handle":"EX-1","@name":"Example, Inc."}}}`)
+		case strings.HasSuffix(path, "/pocs"):
+			// The organisation the name search found is the domain's, its contacts being the ones
+			// the domain search turned up.
+			write(writer, `{"pocs":{"pocLinkRef":{"@handle":"OPS1-ARIN","@function":"AD"}}}`)
+		case strings.HasSuffix(path, "/nets"):
+			write(writer, fmt.Sprintf(
+				`{"nets":{"netRef":{"@handle":"NET-1","@name":"EXAMPLE-ARIN-NET","@startAddress":%q,"@endAddress":%q}}}`,
+				first, last,
+			))
+		default:
+			write(writer, fmt.Sprintf(`{"objects":{"object":[{"attributes":{"attribute":[
+				{"name":"inetnum","value":%q},
+				{"name":"netname","value":"EXAMPLE-NET"},
+				{"name":"status","value":"ASSIGNED PA"}
+			]}}]}}`, inetnum))
 		}
 	}
 }
@@ -155,6 +283,205 @@ func TestFindRaisesConfidenceWhenBothAgree(t *testing.T) {
 	}
 	if got := ranges[0].Confidence(); got != RipeConfidence+1 {
 		t.Errorf("expected agreement to raise the confidence, got %d", got)
+	}
+}
+
+// TestFindMergesTheRegistries holds why there are two of them: they are separate databases
+// answering about separate parts of the world, and a party holding space in both is found in both.
+func TestFindMergesTheRegistries(t *testing.T) {
+	t.Parallel()
+
+	rangeFinder := newFinder(
+		t,
+		registriesHandler(t, "192.0.2.0 - 192.0.2.255", "198.51.100.0", "198.51.100.255"),
+		nil,
+	)
+
+	ranges, err := rangeFinder.Find(t.Context(), "example.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !slices.Equal(networksOf(ranges), []string{"192.0.2.0/24", "198.51.100.0/24"}) {
+		t.Fatalf("expected both registries, sorted, got %v", networksOf(ranges))
+	}
+
+	// Each keeps the name its own registry gave it.
+	if ranges[0].NetName != "EXAMPLE-NET" || ranges[1].NetName != "EXAMPLE-ARIN-NET" {
+		t.Errorf("expected each registry's name kept, got %q and %q", ranges[0].NetName, ranges[1].NetName)
+	}
+	if got := inference.Methods(ranges[1].Inferences); !slices.Equal(got, []inference.Method{MethodArin}) {
+		t.Errorf("expected the range attributed to the other registry, got %v", got)
+	}
+}
+
+// TestFindRaisesConfidenceWhenTheRegistriesAgree holds why they are separate methods rather than one
+// "registry": a range both databases name is a range two records agree on, which is worth more than
+// either alone.
+func TestFindRaisesConfidenceWhenTheRegistriesAgree(t *testing.T) {
+	t.Parallel()
+
+	rangeFinder := newFinder(
+		t,
+		registriesHandler(t, "192.0.2.0 - 192.0.2.255", "192.0.2.0", "192.0.2.255"),
+		nil,
+	)
+
+	ranges, err := rangeFinder.Find(t.Context(), "example.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(ranges) != 1 {
+		t.Fatalf("expected the one range both hold, got %d: %v", len(ranges), networksOf(ranges))
+	}
+	if got := ranges[0].Confidence(); got != RipeConfidence+1 {
+		t.Errorf("expected agreement to raise the confidence, got %d", got)
+	}
+}
+
+// TestFindReachesTheRegistriesThatCannotSearchByDomain holds the two routes into a database that
+// offers no search from a domain: the inverse search on the conventional abuse mailbox, and the name
+// search checked against the address on a party's contact card. Neither is a superset of the other,
+// so both run.
+func TestFindReachesTheRegistriesThatCannotSearchByDomain(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/rdap+json")
+
+		card := `["vcard",[["fn",{},"text","Example Ltd"],["kind",{},"text","org"],` +
+			`["email",{},"text","noc@example.com"]]]`
+
+		if strings.HasPrefix(request.URL.Path, "/entities") {
+			body := fmt.Sprintf(`{"entitySearchResults":[{"handle":"ORG-EX1","vcardArray":%s}]}`, card)
+			if _, err := fmt.Fprint(writer, body); err != nil {
+				t.Errorf("could not write: %v", err)
+			}
+
+			return
+		}
+
+		body := fmt.Sprintf(
+			`{"handle":"ORG-EX1","vcardArray":%s,"networks":[{"handle":"NET-1","name":"EXAMPLE-RDAP",`+
+				`"cidr0_cidrs":[{"v4prefix":"203.0.113.0","length":24}]}]}`,
+			card,
+		)
+		if _, err := fmt.Fprint(writer, body); err != nil {
+			t.Errorf("could not write: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	serverUrl, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("could not parse the server url: %v", err)
+	}
+
+	whoisClient := whoisServer(t, func(query string) string {
+		if strings.HasPrefix(query, "-i abuse-mailbox") {
+			return "role:  Example NOC\nnic-hdl:  ENOC1-EXAMPLE\nabuse-mailbox: abuse@example.com\n"
+		}
+
+		return "inetnum: 198.18.0.0 - 198.18.0.255\nnetname: EXAMPLE-WHOIS\ncountry: SE\n"
+	})
+
+	rangeFinder := NewFinder(
+		// The registries that do search by domain are left out, so that what comes back is only
+		// what these two routes found.
+		finder_config.WithRipe(ripe.NewClient(ripe_config.WithBaseUrl(&url.URL{Scheme: "http", Host: "127.0.0.1:1"}))),
+		finder_config.WithArin(arin.NewClient(arin_config.WithBaseUrl(&url.URL{Scheme: "http", Host: "127.0.0.1:1"}))),
+		finder_config.WithWhois(MethodApnic, whoisClient),
+		finder_config.WithRdap(MethodApnic, rdap.NewClient(
+			rdap_config.WithBaseUrl(serverUrl),
+			rdap_config.WithFetchOptions(fetch_config.WithHttpClient(server.Client())),
+		)),
+		finder_config.WithResolver(&stubResolver{}),
+	)
+
+	ranges, err := rangeFinder.Find(t.Context(), "example.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !slices.Equal(networksOf(ranges), []string{"198.18.0.0/24", "203.0.113.0/24"}) {
+		t.Fatalf("expected both routes to answer, got %v", networksOf(ranges))
+	}
+
+	// Both are the same registry's records and are worth the same; the steps are what say which
+	// route found which.
+	for _, item := range ranges {
+		if got := inference.Methods(item.Inferences); !slices.Equal(got, []inference.Method{MethodApnic}) {
+			t.Errorf("expected the range attributed to the registry, got %v", got)
+		}
+		if item.Confidence() != ApnicConfidence {
+			t.Errorf("expected the registry confidence, got %d", item.Confidence())
+		}
+	}
+
+	if via := ranges[0].Inferences[0].Via; len(via) == 0 || via[0] != ViaAbuseMailbox {
+		t.Errorf("expected the abuse mailbox route named, got %v", via)
+	}
+	if via := ranges[1].Inferences[0].Via; len(via) == 0 || via[0] != ViaName {
+		t.Errorf("expected the name route named, got %v", via)
+	}
+}
+
+// TestFindSurvivesOneRouteFailing holds that the two routes into a registry are independent: port 43
+// being blocked must not cost the answers of the name search, which is a different transport to a
+// different server.
+func TestFindSurvivesOneRouteFailing(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/rdap+json")
+
+		card := `["vcard",[["fn",{},"text","Example Ltd"],["kind",{},"text","org"],` +
+			`["email",{},"text","noc@example.com"]]]`
+
+		if strings.HasPrefix(request.URL.Path, "/entities") {
+			if _, err := fmt.Fprintf(writer, `{"entitySearchResults":[{"handle":"ORG-EX1","vcardArray":%s}]}`, card); err != nil {
+				t.Errorf("could not write: %v", err)
+			}
+
+			return
+		}
+
+		body := fmt.Sprintf(
+			`{"handle":"ORG-EX1","vcardArray":%s,"networks":[{"handle":"NET-1","name":"EXAMPLE-RDAP",`+
+				`"cidr0_cidrs":[{"v4prefix":"203.0.113.0","length":24}]}]}`,
+			card,
+		)
+		if _, err := fmt.Fprint(writer, body); err != nil {
+			t.Errorf("could not write: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	serverUrl, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("could not parse the server url: %v", err)
+	}
+
+	rangeFinder := NewFinder(
+		finder_config.WithRipe(ripe.NewClient(ripe_config.WithBaseUrl(&url.URL{Scheme: "http", Host: "127.0.0.1:1"}))),
+		finder_config.WithArin(arin.NewClient(arin_config.WithBaseUrl(&url.URL{Scheme: "http", Host: "127.0.0.1:1"}))),
+		// A port nothing is listening on, which is what a blocked port 43 looks like.
+		finder_config.WithWhois(MethodApnic, whois.NewClient("127.0.0.1", whois_config.WithPort("1"))),
+		finder_config.WithRdap(MethodApnic, rdap.NewClient(
+			rdap_config.WithBaseUrl(serverUrl),
+			rdap_config.WithFetchOptions(fetch_config.WithHttpClient(server.Client())),
+		)),
+		finder_config.WithResolver(&stubResolver{}),
+	)
+
+	ranges, err := rangeFinder.Find(t.Context(), "example.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !slices.Equal(networksOf(ranges), []string{"203.0.113.0/24"}) {
+		t.Errorf("expected the working route to survive, got %v", networksOf(ranges))
 	}
 }
 

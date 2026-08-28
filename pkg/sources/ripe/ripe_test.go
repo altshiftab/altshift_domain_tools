@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripe/ripe_config"
@@ -42,6 +44,34 @@ func person(handle string, name string, email string) string {
 			{"str":{"name":"object-type","value":"person"}},
 			{"str":{"name":"nic-hdl","value":%q}},
 			{"str":{"name":"person","value":%q}},
+			{"str":{"name":"e-mail","value":%q}}
+		]}}`,
+		handle, name, email,
+	)
+}
+
+// role renders a contact that is a job rather than somebody. It carries a nic-hdl like a person and
+// no person attribute, which is the whole of the difference here.
+func role(handle string, name string, email string) string {
+	return fmt.Sprintf(
+		`{"doc":{"strs":[
+			{"str":{"name":"object-type","value":"role"}},
+			{"str":{"name":"nic-hdl","value":%q}},
+			{"str":{"name":"role","value":%q}},
+			{"str":{"name":"e-mail","value":%q}}
+		]}}`,
+		handle, name, email,
+	)
+}
+
+// organization renders the party a range belongs to, which is named by its own attribute rather
+// than by a nic-hdl.
+func organization(handle string, name string, email string) string {
+	return fmt.Sprintf(
+		`{"doc":{"strs":[
+			{"str":{"name":"object-type","value":"organisation"}},
+			{"str":{"name":"organisation","value":%q}},
+			{"str":{"name":"org-name","value":%q}},
 			{"str":{"name":"e-mail","value":%q}}
 		]}}`,
 		handle, name, email,
@@ -86,10 +116,100 @@ func TestPersonsChecksTheEmailDomain(t *testing.T) {
 		t.Errorf("expected only the contacts actually at the domain, got %v", handles)
 	}
 
-	// The search is restricted to person objects, or it returns every object type mentioning the
-	// domain.
-	if q := asked.Get("q"); q != "(example.com) AND (object-type:person)" {
-		t.Errorf("expected the person search, got %q", q)
+	// Roles and organisations as well as people: a range is as often registered to "Example NOC" as
+	// to somebody, and an inetnum's org is the party that holds it.
+	q := asked.Get("q")
+	for _, objectType := range ObjectTypes {
+		if !strings.Contains(q, "object-type:"+objectType) {
+			t.Errorf("expected %s objects searched for, got %q", objectType, q)
+		}
+	}
+
+	// Asked for, because the database answers with ten unless it is -- which for a party of any
+	// size is the first ten of something rather than what it holds.
+	if rows := asked.Get("rows"); rows != strconv.Itoa(DefaultSearchRows) {
+		t.Errorf("expected the hits asked for, got %q", rows)
+	}
+}
+
+// TestRegistrantsReadsRolesAndOrganizations holds the two kinds of object a person search misses. A
+// role is a contact like any other, and an organisation is the party a range belongs to rather than
+// somebody to write to about it.
+func TestRegistrantsReadsRolesAndOrganizations(t *testing.T) {
+	t.Parallel()
+
+	client := serverClient(t, func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		body := `{"result":{"numFound":4,"docs":[` +
+			person("AA1-RIPE", "A Person", "someone@example.com") + "," +
+			role("NOC1-RIPE", "Example NOC", "noc@example.com") + "," +
+			organization("ORG-EX1-RIPE", "Example Ltd", "ripe@example.com") + "," +
+			// A stranger the search matched, whatever kind of object it is.
+			organization("ORG-EX2-RIPE", "Elsewhere Ltd", "ripe@elsewhere.test") +
+			`]}}`
+		if _, err := fmt.Fprint(writer, body); err != nil {
+			t.Errorf("could not write: %v", err)
+		}
+	})
+
+	registrants, err := client.Registrants(t.Context(), "example.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	handles := make([]string, 0, len(registrants.Persons))
+	for _, item := range registrants.Persons {
+		handles = append(handles, item.NicHandle)
+	}
+
+	if !slices.Equal(handles, []string{"AA1-RIPE", "NOC1-RIPE"}) {
+		t.Errorf("expected the role kept alongside the person, got %v", handles)
+	}
+	// A role has no person attribute, being a job rather than somebody.
+	if len(registrants.Persons) == 2 && registrants.Persons[1].Name != "Example NOC" {
+		t.Errorf("expected the role's name, got %q", registrants.Persons[1].Name)
+	}
+
+	if len(registrants.Organizations) != 1 || registrants.Organizations[0].Handle != "ORG-EX1-RIPE" {
+		t.Errorf("expected only the organisation at the domain, got %+v", registrants.Organizations)
+	}
+	if len(registrants.Organizations) == 1 && registrants.Organizations[0].Name != "Example Ltd" {
+		t.Errorf("expected the organisation's name, got %+v", registrants.Organizations[0])
+	}
+}
+
+// TestOrganizationRanges holds the other inverse search. An inetnum's org is the party that holds
+// it, where its administrative and technical contacts may be a provider's staff.
+func TestOrganizationRanges(t *testing.T) {
+	t.Parallel()
+
+	var asked url.Values
+
+	client := serverClient(t, func(writer http.ResponseWriter, request *http.Request) {
+		asked = request.URL.Query()
+		writer.Header().Set("Content-Type", "application/json")
+		body := `{"objects":{"object":[
+			{"attributes":{"attribute":[
+				{"name":"inet6num","value":"2001:db8::/32"},
+				{"name":"netname","value":"EXAMPLE-V6"}
+			]}}
+		]}}`
+		if _, err := fmt.Fprint(writer, body); err != nil {
+			t.Errorf("could not write: %v", err)
+		}
+	})
+
+	ranges, err := client.OrganizationRanges(t.Context(), "ORG-EX1-RIPE")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(ranges) != 1 || !slices.Equal(ranges[0].Networks, []string{"2001:db8::/32"}) {
+		t.Fatalf("expected the allocation as CIDR, got %+v", ranges)
+	}
+
+	if got := asked["inverse-attribute"]; !slices.Equal(got, OrganizationInverseAttributes) {
+		t.Errorf("expected the org inverse, got %v", got)
 	}
 }
 
@@ -171,11 +291,16 @@ func TestRanges(t *testing.T) {
 		t.Errorf("expected the registry's name for it, got %+v", ranges[0])
 	}
 
-	// Both roles: a party administering a range and one operating it are equally good evidence
-	// that the space is theirs.
-	inverse := asked["inverse-attribute"]
-	if !slices.Contains(inverse, "admin-c") || !slices.Contains(inverse, "tech-c") {
-		t.Errorf("expected both roles to be searched, got %v", inverse)
+	// Every role: a party administering a range, one operating it and one taking the complaints
+	// about it are equally good evidence that the space is theirs.
+	if inverse := asked["inverse-attribute"]; !slices.Equal(inverse, PersonInverseAttributes) {
+		t.Errorf("expected every role to be searched, got %v", inverse)
+	}
+
+	// Both families. This is the one that was wrong: a filter naming only inetnum excludes inet6num
+	// rather than covering it, so a party holding v6 space looked as though it held none.
+	if filters := asked["type-filter"]; !slices.Equal(filters, TypeFilters) {
+		t.Errorf("expected both address families, got %v", filters)
 	}
 }
 
@@ -220,6 +345,15 @@ func TestNetworks(t *testing.T) {
 			expect:  []string{"10.0.0.1/32", "10.0.0.2/31", "10.0.0.4/31", "10.0.0.6/32"},
 		},
 		{name: "already a prefix", inetnum: "192.0.2.0/24", expect: []string{"192.0.2.0/24"}},
+		// An inet6num is written as a prefix rather than as two addresses, so it is the no-dash case.
+		{name: "an inet6num", inetnum: "2001:db8::/32", expect: []string{"2001:db8::/32"}},
+		// A v6 allocation written as two addresses is covered like any other. It used to be dropped,
+		// which made a party holding v6 space look as though it held none.
+		{
+			name:    "a v6 range",
+			inetnum: "2606:4700:: - 2606:4700:ffff:ffff:ffff:ffff:ffff:ffff",
+			expect:  []string{"2606:4700::/32"},
+		},
 		{name: "not a range at all", inetnum: "nonsense", expectError: true},
 		{name: "the end before the start", inetnum: "10.0.0.6 - 10.0.0.1", expectError: true},
 	}

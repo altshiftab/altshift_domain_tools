@@ -14,7 +14,12 @@ What can be learned about a domain from outside it.
 | `pkg/subdomain/brute` | Wordlist brute force over DNS |
 | `pkg/subdomain/wordlist` | The embedded default list |
 | `pkg/network_range` | What address space does this owner hold? `192.0.2.0/24` |
-| `pkg/sources/ripe` | Registry contacts and their allocations |
+| `pkg/sources/ripe` | Registry contacts and their allocations, for Europe and around it |
+| `pkg/sources/arin` | The same, for North America |
+| `pkg/sources/whois` | Inverse queries over port 43, for the registries with nothing better |
+| `pkg/sources/rdap` | Parties by name, for the same |
+| `pkg/cidr` | An address range as the prefixes that cover it |
+| `pkg/email` | Is this registered address at the domain? |
 | `pkg/inference` | How something was found, and what that is worth |
 | `pkg/resolver` | Does this name resolve, and why not |
 
@@ -107,16 +112,74 @@ rangeFinder := finder.NewFinder()
 ranges, err := rangeFinder.Find(ctx, "example.com")
 ```
 
-Two sources, run together. The registry knows what a party was *allocated*, including space it is
-not using; the domain's SPF record declares what it *sends from*, including space it uses under
-someone else's allocation. Neither is a superset of the other.
+Four registries and a mail policy, run together. A registry knows what a party was *allocated*,
+including space it is not using; the domain's SPF record declares what it *sends from*, including
+space it uses under someone else's allocation. None is a superset of another.
 
 The SPF walk follows `include:` and `redirect:` only within the same registered domain. Without
 that, a domain whose record says `include:_spf.google.com` would contribute Google's entire mail
 estate to its owner -- wrong, and enormous.
 
-RIPE covers Europe, the Middle East and Central Asia, so an empty answer is not evidence that a
-party holds nothing.
+Each registry is its own method rather than all of them being "the registry", so a range more than
+one of them names is a range independent records agree on and is scored accordingly. All four are
+worth the same, because all four rest on the same thing: an address at the domain, found in the
+registry's own record. What differs is the route taken to it, and that is what the inference's steps
+say. LACNIC is the one that is missing, so an empty answer is still not evidence that a party holds
+nothing.
+
+**RIPE** answers a full-text search with the objects registered at a domain, and an inverse search
+with the ranges those objects are referenced by. Both steps are wider than the obvious version, and
+each way they are wider was a party's space going unfound: the search reads roles and organisations
+as well as people -- a range is as often registered to "Example NOC" as to somebody, and an
+inetnum's `org` is the party that holds it where its contacts may be a provider's staff -- and asks
+for more than the ten hits the database answers with by default. The inverse search reads `abuse-c`
+alongside `admin-c` and `tech-c`, and asks for `inet6num` as well as `inetnum`: a filter naming only
+the latter *excludes* the former rather than covering it, so a party holding v6 space looked as
+though it held none.
+
+**ARIN** has a real search over contacts' e-mail addresses -- stricter than RIPE's full-text guess --
+but none from a contact to the space they administer: only an organisation holds ranges, and an
+organisation is reachable by name. So the name is the bridge, read off the contacts the domain search
+found, and the organisations it turns up are checked back against those same contacts:
+
+```
+pocs;domain=example.com -> poc/{handle} -> orgs;name={company}* -> org/{handle}/pocs -> org/{handle}/nets
+                                                                   ^ the check
+```
+
+**APNIC and AFRINIC** offer no search from a domain at all. Both refuse an inverse search on e-mail
+outright -- `%ERROR:105: "e-mail" is not an inverse searchable attribute`, the same removal RIPE made
+-- and RDAP defines only two searchable properties for a party, its name and its handle (RFC 9082).
+So there are two ways in, neither a superset of the other, and both run:
+
+```
+whois -i abuse-mailbox abuse@example.com  ->  -i admin-c,tech-c {handle}  ->  inetnum
+rdap  /entities?fn={name}  ->  /entity/{handle}  ->  networks
+                               ^ the check: an address at the domain, on the party's card
+```
+
+The first works because an abuse contact is conventionally at the party's own domain. That is a
+convention rather than a rule, so it finds a party that follows it and not one whose registered abuse
+contact is at its provider's domain or is a named individual. The second needs a name, and takes the
+domain's own label together with whatever ARIN turned out to call the owner -- which is why the
+registries that search by domain run first.
+
+Every one of these ends in the same check: an address at the domain, in the registry's own record.
+Without it a name would be doing the attributing, and a stranger sharing one would have its address
+space handed to the domain's owner. All the walks are bounded -- `MaxPersons`, `MaxOrganizations`,
+`MaxContacts`, `MaxNames`, `MaxEntities` -- because the steps multiply and the databases ask callers
+to be gentle.
+
+`pkg/sources/whois` is the only thing here that is not HTTP: port 43 is a line of text in and a
+document out, with no status code, no content type and no length. What structure there is comes from
+RPSL, and errors arrive in comments -- `%ERROR:101` for nothing found, which is an answer, against
+`%ERROR:105` for a refused query, which is not.
+
+`pkg/cidr` is what turns a registry's "first address - last address" into prefixes. An arbitrary
+range is not one prefix: `10.0.0.1 - 10.0.0.6` is a `/32`, a `/30` and a `/31`, and the alternative
+-- one prefix too large -- would attribute addresses the party does not hold. Both ends are host
+addresses, neither a network nor a broadcast address: the registry is stating the extent of what a
+party holds rather than an addressing plan.
 
 ## Inference
 
@@ -131,6 +194,6 @@ would make co-location look like proof.
 
 ## Credentials
 
-`crtsh`, `ripe` and the SPF walk need none. HackerTarget's host search is metered anonymously and
+`crtsh`, all four registries and the SPF walk need none. HackerTarget's host search is metered anonymously and
 reports what is left of the allowance; its reverse IP lookup and WhoisXML both need keys, which are
 given to `related.NewFinder` rather than passed per call.

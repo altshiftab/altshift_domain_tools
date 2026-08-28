@@ -1,5 +1,5 @@
-// Package ripe_config holds the settings of a RIPE database client.
-package ripe_config
+// Package arin_config holds the settings of an ARIN database client.
+package arin_config
 
 import (
 	"net/url"
@@ -11,23 +11,19 @@ type Config struct {
 	// BaseUrl is the database the queries are sent to. A nil one is the public REST API.
 	BaseUrl *url.URL
 
-	// MaxPersons bounds how many person objects a domain search reads before it stops looking up
-	// the ranges behind them. Zero is the default.
+	// MaxPersons bounds how many contacts a domain search reads in full. Zero is the default.
 	//
-	// It matters because the two steps multiply: every handle found becomes a query of its own, so
-	// a domain that matches a hundred people is a hundred requests against a database that asks
-	// callers to be gentle.
+	// It matters because the search answers with handles alone, so learning the company a contact
+	// belongs to -- which is the only bridge ARIN offers from a domain to an organisation -- is a
+	// request per contact.
 	MaxPersons int
 
-	// MaxOrganizations bounds how many organisation objects a domain search reads before it stops
-	// looking up the ranges behind them. Zero is the default.
-	MaxOrganizations int
-
-	// SearchRows is how many hits the domain search asks for. Zero is the default.
+	// MaxOrganizations bounds how many of the organisations a name search turns up are checked
+	// against the contacts. Zero is the default.
 	//
-	// It matters because the database answers with ten unless asked otherwise, which for a party of
-	// any size is the first ten of something rather than what it holds.
-	SearchRows int
+	// It matters because a short name matches a great many organisations, and each one is two
+	// further requests: the contacts to check it by, and the ranges if it holds.
+	MaxOrganizations int
 
 	// FetchOptions are passed to every request the client makes.
 	FetchOptions []fetch_config.Option
@@ -63,12 +59,6 @@ func WithMaxPersons(maxPersons int) Option {
 func WithMaxOrganizations(maxOrganizations int) Option {
 	return func(config *Config) {
 		config.MaxOrganizations = maxOrganizations
-	}
-}
-
-func WithSearchRows(searchRows int) Option {
-	return func(config *Config) {
-		config.SearchRows = searchRows
 	}
 }
 

@@ -1,4 +1,4 @@
-package ripe_config
+package rdap_config
 
 import (
 	"net/url"
@@ -12,14 +12,14 @@ func TestNew(t *testing.T) {
 
 	baseUrl := &url.URL{Scheme: "https", Host: "example.test"}
 
-	// No options is the ordinary call: the client fills in the public database, so the config
-	// leaving the base URL nil is what says "unset" rather than "the empty URL".
+	// No options is a client with no server, which is an error rather than a default: RDAP is a
+	// protocol several registries answer, and there is none this could sensibly mean.
 	empty := New()
 	if empty == nil {
 		t.Fatal("expected a config, got nil")
 	}
-	if empty.BaseUrl != nil || empty.MaxPersons != 0 || empty.MaxOrganizations != 0 ||
-		empty.SearchRows != 0 || len(empty.FetchOptions) != 0 {
+	if empty.BaseUrl != nil || empty.NameSuffix != "" || empty.MaxNames != 0 ||
+		empty.MaxEntities != 0 || len(empty.FetchOptions) != 0 {
 		t.Errorf("expected everything unset, got %+v", empty)
 	}
 
@@ -30,9 +30,9 @@ func TestNew(t *testing.T) {
 
 	config := New(
 		WithBaseUrl(baseUrl),
-		WithMaxPersons(5),
-		WithMaxOrganizations(4),
-		WithSearchRows(200),
+		WithNameSuffix("*"),
+		WithMaxNames(4),
+		WithMaxEntities(7),
 		WithFetchOptions(fetch_config.WithMethod("GET")),
 		// Accumulating rather than replacing: two calls are how a caller adds to what an earlier
 		// one set, and replacing would silently drop it.
@@ -42,14 +42,12 @@ func TestNew(t *testing.T) {
 	if config.BaseUrl != baseUrl {
 		t.Errorf("expected the base url to be taken, got %v", config.BaseUrl)
 	}
-	// The bound matters because the two search steps multiply: every handle becomes a query.
-	if config.MaxPersons != 5 || config.MaxOrganizations != 4 {
-		t.Errorf("expected the bounds to be taken, got %+v", config)
+	// The suffix is a setting because the registries do not agree on how a name search matches.
+	if config.NameSuffix != "*" {
+		t.Errorf("expected the name suffix to be taken, got %q", config.NameSuffix)
 	}
-	// The database answers with ten hits unless asked otherwise, which for a party of any size is
-	// the first ten of something rather than what it holds.
-	if config.SearchRows != 200 {
-		t.Errorf("expected the row count to be taken, got %d", config.SearchRows)
+	if config.MaxNames != 4 || config.MaxEntities != 7 {
+		t.Errorf("expected the bounds to be taken, got %+v", config)
 	}
 	if len(config.FetchOptions) != 2 {
 		t.Errorf("expected the fetch options to accumulate, got %d", len(config.FetchOptions))

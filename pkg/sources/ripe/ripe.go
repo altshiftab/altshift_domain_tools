@@ -1,9 +1,18 @@
 // Package ripe queries the RIPE database for the address space a party holds.
 //
-// It answers in two steps, which is what makes it worth having. A full-text search finds the person
-// objects registered at a domain, and an inverse search finds the ranges those people administer.
+// It answers in two steps, which is what makes it worth having. A full-text search finds the objects
+// registered at a domain, and an inverse search finds the ranges those objects are referenced by.
 // Starting from the domain rather than from an address is the point: it finds space the party holds
 // but is not currently using, which nothing that begins with a hostname can see.
+//
+// Both steps are wider than the obvious version of them, and each way they are wider was a party's
+// space going unfound. The search reads roles and organisations as well as people, because a range
+// is as often registered to "Example NOC" as to somebody, and because an inetnum's org is the party
+// that holds it where its contacts may be a provider's staff. It asks for more than the ten hits
+// the database answers with by default. The inverse search reads the abuse contact as well as the
+// administrative and technical ones, and asks for inet6num as well as inetnum -- a filter naming
+// only the latter excludes the former rather than covering it, so a party holding v6 space looked
+// as though it held none.
 //
 // RIPE covers Europe, the Middle East and Central Asia. A party whose space is registered with
 // ARIN, APNIC, AFRINIC or LACNIC will not be found here, and an empty answer is therefore not
@@ -12,15 +21,16 @@ package ripe
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 
+	"github.com/altshiftab/altshift_domain_tools/pkg/cidr"
+	"github.com/altshiftab/altshift_domain_tools/pkg/email"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripe/ripe_config"
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 	"github.com/altshiftab/utils_go/pkg/errors/types/empty_error"
@@ -48,15 +58,66 @@ const (
 // and the ranges behind the hundredth match are not better evidence than those behind the first.
 const DefaultMaxPersons = 25
 
-// ErrMalformedRange is an inetnum that is not the "start - end" the database documents.
-var ErrMalformedRange = errors.New("malformed range")
+// DefaultMaxOrganizations bounds how many organisation objects a domain search reads, for the same
+// reason: every handle found becomes a query of its own.
+const DefaultMaxOrganizations = 25
 
-// Person is a registered contact.
+// ErrMalformedRange is an inetnum that is not the "start - end" the database documents.
+//
+// It is the conversion's own error rather than one of this package's, so that a caller checking for
+// it catches both the inetnum that is not a range and the pair of addresses that is not one.
+var ErrMalformedRange = cidr.ErrMalformedRange
+
+// ObjectTypes are the objects a domain search reads.
+//
+// A role as well as a person, because a range is as often registered to "Example NOC" as to
+// somebody; and an organisation, because an inetnum's org is the party that holds it, where its
+// contacts may be a provider's staff.
+var ObjectTypes = []string{"person", "role", "organisation"}
+
+// The attributes a range is looked for under.
+var (
+	// PersonInverseAttributes are the ways a range points at a contact. Abuse as well as
+	// administrative and technical, because a party is sometimes only the abuse contact on space it
+	// holds.
+	PersonInverseAttributes = []string{"admin-c", "tech-c", "abuse-c"}
+	// OrganizationInverseAttributes are the ways a range points at an organisation.
+	OrganizationInverseAttributes = []string{"org"}
+)
+
+// TypeFilters are the object types a range is written as. Both, because a filter naming only
+// inetnum excludes inet6num rather than covering it, and a party holding v6 space would look as
+// though it held none.
+var TypeFilters = []string{"inetnum", "inet6num"}
+
+// DefaultSearchRows is how many hits a domain search reads.
+//
+// The database answers with ten unless asked otherwise, which for a party of any size is the first
+// ten of something rather than what it holds.
+const DefaultSearchRows = 100
+
+// Person is a registered contact -- a person or a role, which the database distinguishes and a walk
+// from a domain does not.
 type Person struct {
 	// NicHandle is the database's identifier for the contact, which is what the ranges reference.
 	NicHandle string `json:"nic_handle,omitzero"`
 	Name      string `json:"name,omitzero"`
 	Email     string `json:"email,omitzero"`
+}
+
+// Organization is a registered party.
+type Organization struct {
+	// Handle is the database's identifier for it, which is what the ranges reference.
+	Handle string `json:"handle,omitzero"`
+	Name   string `json:"name,omitzero"`
+	Email  string `json:"email,omitzero"`
+}
+
+// Registrants is what a domain search finds, by what a range would have to reference to be reached
+// through it.
+type Registrants struct {
+	Persons       []*Person       `json:"persons,omitzero"`
+	Organizations []*Organization `json:"organizations,omitzero"`
 }
 
 // Range is one registered allocation.
@@ -144,6 +205,22 @@ func (client *Client) maxPersons() int {
 	return DefaultMaxPersons
 }
 
+func (client *Client) maxOrganizations() int {
+	if maxOrganizations := client.config.MaxOrganizations; maxOrganizations > 0 {
+		return maxOrganizations
+	}
+
+	return DefaultMaxOrganizations
+}
+
+func (client *Client) searchRows() int {
+	if searchRows := client.config.SearchRows; searchRows > 0 {
+		return searchRows
+	}
+
+	return DefaultSearchRows
+}
+
 // fetchOptions is the client's options with the call's appended.
 //
 // slices.Concat rather than append: the client's options are shared by every call, and appending
@@ -171,34 +248,15 @@ func values(pairs []*nameValue) map[string]string {
 	return found
 }
 
-// emailAtDomain reports whether the address is at the domain or a subdomain of it.
+// Registrants returns everything registered at the domain that a range can be reached through.
 //
-// The full-text search matches the domain anywhere in an object, so a person whose postal address
-// or remarks happen to mention it comes back alongside the ones whose e-mail is actually there.
-// Attributing a stranger's address space to a customer on that basis would be a serious error, so
-// the matches are checked rather than trusted.
-func emailAtDomain(email string, domain string) bool {
-	email = strings.ToLower(strings.TrimSpace(email))
-	domain = strings.ToLower(strings.TrimSpace(domain))
-
-	if email == "" || domain == "" {
-		return false
-	}
-
-	_, host, found := strings.Cut(email, "@")
-	if !found || host == "" {
-		return false
-	}
-
-	return host == domain || strings.HasSuffix(host, "."+domain)
-}
-
-// Persons returns the contacts registered with an address at the domain.
-func (client *Client) Persons(
+// One search rather than three, the database being willing to answer for several object types at
+// once and every request against it being one a caller should think twice about.
+func (client *Client) Registrants(
 	ctx context.Context,
 	domain string,
 	options ...fetch_config.Option,
-) ([]*Person, error) {
+) (*Registrants, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("context err: %w", err)
 	}
@@ -211,11 +269,19 @@ func (client *Client) Persons(
 		return nil, altshiftErrors.NewWithTrace(empty_error.New("domain"))
 	}
 
+	types := make([]string, 0, len(ObjectTypes))
+	for _, objectType := range ObjectTypes {
+		types = append(types, "object-type:"+objectType)
+	}
+
 	requestUrl := *client.baseUrl
 	requestUrl.Path += FullTextSearchPath
 	requestUrl.RawQuery = url.Values{
-		"q":  []string{fmt.Sprintf("(%s) AND (object-type:person)", domain)},
+		"q":  []string{fmt.Sprintf("(%s) AND (%s)", domain, strings.Join(types, " OR "))},
 		"wt": []string{"json"},
+		// Without this the search answers with ten hits whatever it found, which for a party of any
+		// size is the first ten of something rather than what it holds.
+		"rows": []string{strconv.Itoa(client.searchRows())},
 	}.Encode()
 
 	requestUrlString := requestUrl.String()
@@ -229,11 +295,12 @@ func (client *Client) Persons(
 		return nil, altshiftErrors.New(fmt.Errorf("fetch json: %w", err), requestUrlString)
 	}
 
+	registrants := &Registrants{Persons: []*Person{}, Organizations: []*Organization{}}
+
 	if response == nil || response.Result == nil {
-		return []*Person{}, nil
+		return registrants, nil
 	}
 
-	persons := make([]*Person, 0, len(response.Result.Docs))
 	seen := make(map[string]struct{})
 
 	for _, doc := range response.Result.Docs {
@@ -250,28 +317,79 @@ func (client *Client) Persons(
 
 		attributes := values(pairs)
 
-		handle := attributes["nic-hdl"]
-		email := attributes["e-mail"]
+		address := attributes["e-mail"]
 
-		// The search matched the domain somewhere in the object; only an address at the domain
-		// says the person belongs to it.
-		if handle == "" || !emailAtDomain(email, domain) {
+		// The search matched the domain somewhere in the object; only an address at the domain says
+		// the object belongs to it. Attributing a stranger's address space to a customer on a postal
+		// address or a remark that happens to mention the domain would be a serious error.
+		if !email.AtDomain(address, domain) {
 			continue
 		}
 
-		if _, ok := seen[handle]; ok {
-			continue
-		}
-		seen[handle] = struct{}{}
+		// What the object is, is what it opens with. A contact -- a person or a role alike -- is
+		// named by its nic-hdl and referenced by the ranges it is a contact on; an organisation is
+		// named by its own attribute and referenced by their org.
+		switch {
+		case attributes["nic-hdl"] != "":
+			handle := attributes["nic-hdl"]
+			if _, ok := seen[handle]; ok || len(registrants.Persons) >= client.maxPersons() {
+				continue
+			}
+			seen[handle] = struct{}{}
 
-		persons = append(persons, &Person{NicHandle: handle, Name: attributes["person"], Email: email})
+			// A role has no person attribute, being a job rather than somebody.
+			name := attributes["person"]
+			if name == "" {
+				name = attributes["role"]
+			}
 
-		if len(persons) >= client.maxPersons() {
-			break
+			registrants.Persons = append(
+				registrants.Persons,
+				&Person{NicHandle: handle, Name: name, Email: address},
+			)
+		case attributes["organisation"] != "":
+			handle := attributes["organisation"]
+			if _, ok := seen[handle]; ok || len(registrants.Organizations) >= client.maxOrganizations() {
+				continue
+			}
+			seen[handle] = struct{}{}
+
+			registrants.Organizations = append(
+				registrants.Organizations,
+				&Organization{Handle: handle, Name: attributes["org-name"], Email: address},
+			)
 		}
 	}
 
-	return persons, nil
+	return registrants, nil
+}
+
+// Persons returns the contacts registered with an address at the domain.
+func (client *Client) Persons(
+	ctx context.Context,
+	domain string,
+	options ...fetch_config.Option,
+) ([]*Person, error) {
+	registrants, err := client.Registrants(ctx, domain, options...)
+	if err != nil {
+		return nil, fmt.Errorf("registrants: %w", err)
+	}
+
+	return registrants.Persons, nil
+}
+
+// Organizations returns the organisations registered with an address at the domain.
+func (client *Client) Organizations(
+	ctx context.Context,
+	domain string,
+	options ...fetch_config.Option,
+) ([]*Organization, error) {
+	registrants, err := client.Registrants(ctx, domain, options...)
+	if err != nil {
+		return nil, fmt.Errorf("registrants: %w", err)
+	}
+
+	return registrants.Organizations, nil
 }
 
 // Ranges returns the allocations the contact administers.
@@ -292,14 +410,58 @@ func (client *Client) Ranges(
 		return nil, altshiftErrors.NewWithTrace(empty_error.New("nic handle"))
 	}
 
+	ranges, err := client.inverseRanges(ctx, nicHandle, PersonInverseAttributes, options)
+	if err != nil {
+		return nil, altshiftErrors.New(fmt.Errorf("inverse ranges: %w", err), nicHandle)
+	}
+
+	return ranges, nil
+}
+
+// OrganizationRanges returns the allocations registered to the organisation.
+//
+// It is the other half of what a domain search finds, and the better half: an inetnum's org is the
+// party that holds it, where its administrative and technical contacts may be a provider's staff.
+func (client *Client) OrganizationRanges(
+	ctx context.Context,
+	handle string,
+	options ...fetch_config.Option,
+) ([]*Range, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("context err: %w", err)
+	}
+
+	if client == nil {
+		return nil, altshiftErrors.NewWithTrace(nil_error.New("client"))
+	}
+
+	if handle == "" {
+		return nil, altshiftErrors.NewWithTrace(empty_error.New("handle"))
+	}
+
+	ranges, err := client.inverseRanges(ctx, handle, OrganizationInverseAttributes, options)
+	if err != nil {
+		return nil, altshiftErrors.New(fmt.Errorf("inverse ranges: %w", err), handle)
+	}
+
+	return ranges, nil
+}
+
+// inverseRanges returns the allocations referencing the handle in one of the attributes.
+func (client *Client) inverseRanges(
+	ctx context.Context,
+	handle string,
+	attributes []string,
+	options []fetch_config.Option,
+) ([]*Range, error) {
 	requestUrl := *client.baseUrl
 	requestUrl.Path += SearchPath
 	requestUrl.RawQuery = url.Values{
-		"query-string": []string{nicHandle},
-		// Both roles, because a party administering a range and a party operating it are equally
-		// good evidence that the space is theirs.
-		"inverse-attribute": []string{"admin-c", "tech-c"},
-		"type-filter":       []string{"inetnum"},
+		"query-string":      []string{handle},
+		"inverse-attribute": attributes,
+		// Both families. A filter naming only inetnum excludes inet6num rather than covering it,
+		// and a party holding v6 space would look as though it held none.
+		"type-filter": TypeFilters,
 		// Without this the database returns every object referenced by each match, which is a great
 		// deal of data none of it needs.
 		"flags": []string{"no-referenced"},
@@ -367,66 +529,23 @@ func (client *Client) Ranges(
 // Networks expresses an inetnum as CIDR.
 //
 // The database writes an allocation as a first and last address, and an arbitrary range of
-// addresses is not one prefix: 10.0.0.1 - 10.0.0.6 is a /32, a /30 and a /31. So this returns
-// however many prefixes it takes to cover the range exactly, rather than the one that would have to
-// be too large.
+// addresses is not one prefix, so this is however many prefixes it takes to cover the range exactly
+// rather than the one that would have to be too large.
 func Networks(inetnum string) ([]string, error) {
 	first, last, found := strings.Cut(inetnum, "-")
 	if !found {
-		// A single address, or already a prefix.
-		if _, network, err := net.ParseCIDR(strings.TrimSpace(inetnum)); err == nil && network != nil {
-			return []string{network.String()}, nil
+		// A single address, or already a prefix. An inet6num is written this way.
+		networks, err := cidr.Prefixes(inetnum)
+		if err != nil {
+			return nil, altshiftErrors.New(fmt.Errorf("prefixes: %w", err), inetnum)
 		}
 
-		return nil, altshiftErrors.NewWithTrace(ErrMalformedRange, inetnum)
+		return networks, nil
 	}
 
-	start := net.ParseIP(strings.TrimSpace(first))
-	end := net.ParseIP(strings.TrimSpace(last))
-	if start == nil || end == nil {
-		return nil, altshiftErrors.NewWithTrace(ErrMalformedRange, inetnum)
-	}
-
-	startIpv4 := start.To4()
-	endIpv4 := end.To4()
-	if startIpv4 == nil || endIpv4 == nil {
-		// IPv6 ranges are left as they were written rather than expanded: the arithmetic below is
-		// 32-bit, and a v6 allocation is already a prefix in practice.
-		return nil, nil
-	}
-
-	startValue := binary.BigEndian.Uint32(startIpv4)
-	endValue := binary.BigEndian.Uint32(endIpv4)
-
-	if startValue > endValue {
-		return nil, altshiftErrors.NewWithTrace(ErrMalformedRange, inetnum)
-	}
-
-	networks := make([]string, 0)
-
-	for {
-		// The largest block that starts here and does not run past the end. The first term is what
-		// the start address is aligned to; the second is what is left to cover.
-		size := uint32(1)
-		for size<<1 != 0 && startValue&(size<<1-1) == 0 && startValue+(size<<1)-1 <= endValue {
-			size <<= 1
-		}
-
-		ones := 32
-		for bit := size; bit > 1; bit >>= 1 {
-			ones--
-		}
-
-		address := make(net.IP, net.IPv4len)
-		binary.BigEndian.PutUint32(address, startValue)
-		networks = append(networks, fmt.Sprintf("%s/%d", address.String(), ones))
-
-		next := startValue + size
-		// The range reached the top of the address space, so there is nothing after it.
-		if next < startValue || next > endValue {
-			break
-		}
-		startValue = next
+	networks, err := cidr.CoverText(first, last)
+	if err != nil {
+		return nil, altshiftErrors.New(fmt.Errorf("cover text: %w", err), inetnum)
 	}
 
 	return networks, nil

@@ -1,4 +1,4 @@
-package ripe_config
+package arin_config
 
 import (
 	"net/url"
@@ -19,7 +19,7 @@ func TestNew(t *testing.T) {
 		t.Fatal("expected a config, got nil")
 	}
 	if empty.BaseUrl != nil || empty.MaxPersons != 0 || empty.MaxOrganizations != 0 ||
-		empty.SearchRows != 0 || len(empty.FetchOptions) != 0 {
+		len(empty.FetchOptions) != 0 {
 		t.Errorf("expected everything unset, got %+v", empty)
 	}
 
@@ -31,8 +31,7 @@ func TestNew(t *testing.T) {
 	config := New(
 		WithBaseUrl(baseUrl),
 		WithMaxPersons(5),
-		WithMaxOrganizations(4),
-		WithSearchRows(200),
+		WithMaxOrganizations(3),
 		WithFetchOptions(fetch_config.WithMethod("GET")),
 		// Accumulating rather than replacing: two calls are how a caller adds to what an earlier
 		// one set, and replacing would silently drop it.
@@ -42,14 +41,13 @@ func TestNew(t *testing.T) {
 	if config.BaseUrl != baseUrl {
 		t.Errorf("expected the base url to be taken, got %v", config.BaseUrl)
 	}
-	// The bound matters because the two search steps multiply: every handle becomes a query.
-	if config.MaxPersons != 5 || config.MaxOrganizations != 4 {
-		t.Errorf("expected the bounds to be taken, got %+v", config)
+	// The bounds matter because the steps multiply: every contact becomes a request, and every
+	// organisation two more.
+	if config.MaxPersons != 5 {
+		t.Errorf("expected the contact bound to be taken, got %d", config.MaxPersons)
 	}
-	// The database answers with ten hits unless asked otherwise, which for a party of any size is
-	// the first ten of something rather than what it holds.
-	if config.SearchRows != 200 {
-		t.Errorf("expected the row count to be taken, got %d", config.SearchRows)
+	if config.MaxOrganizations != 3 {
+		t.Errorf("expected the organisation bound to be taken, got %d", config.MaxOrganizations)
 	}
 	if len(config.FetchOptions) != 2 {
 		t.Errorf("expected the fetch options to accumulate, got %d", len(config.FetchOptions))
