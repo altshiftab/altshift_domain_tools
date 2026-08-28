@@ -8,11 +8,32 @@ import (
 
 	"github.com/altshiftab/altshift_domain_tools/pkg/related"
 	"github.com/altshiftab/altshift_domain_tools/pkg/related/related_config"
+	"github.com/altshiftab/altshift_domain_tools/pkg/sources/whoisxml"
 	"github.com/altshiftab/utils_go/pkg/cli/argument_parser"
 	"github.com/altshiftab/utils_go/pkg/cli/argument_parser/option"
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 	"github.com/altshiftab/utils_go/pkg/errors/types/empty_error"
 )
+
+// The answers --search-type takes. "both" is not one of the API's own search types but a request
+// for each of them, so it is spelled out here rather than passed through.
+const (
+	searchTypeCurrent  = whoisxml.SearchTypeCurrent
+	searchTypeHistoric = whoisxml.SearchTypeHistoric
+	searchTypeBoth     = "both"
+)
+
+// searchTypes is what the chosen answer asks the library for.
+func searchTypes(chosen string) []string {
+	if chosen == searchTypeBoth {
+		return []string{whoisxml.SearchTypeCurrent, whoisxml.SearchTypeHistoric}
+	}
+	if chosen == "" {
+		return nil
+	}
+
+	return []string{chosen}
+}
 
 // The environment variables the keys are read from when no file is given.
 const (
@@ -24,7 +45,8 @@ type relatedSettings struct {
 	domain              string
 	whoisXmlKeyFile     string
 	hackerTargetKeyFile string
-	historical          bool
+	organization        string
+	searchType          string
 	asJson              bool
 }
 
@@ -57,12 +79,37 @@ func newRelatedCommand() *command {
 					),
 					"PATH",
 				),
-				option.NewBoolOption(
-					'H',
-					"historical",
-					"Search registrations as they once were rather than as they stand.",
-					false,
-					&settings.historical,
+				option.WithMetavar(
+					option.NewStringOption(
+						'o',
+						"organization",
+						"The party's registered name, for the search that finds what a redacted "+
+							"address cannot. Without it, the domain's own label is tried.",
+						false,
+						&settings.organization,
+					),
+					"NAME",
+				),
+				// A choice rather than a flag, because there are three answers and they cost
+				// differently. The historic records hold what redaction has since taken out of the
+				// current ones, and are worth sweeping once for a domain; the current records are
+				// what a repeated run should ask for, and are the default for that reason.
+				option.WithChoices(
+					option.WithDefault(
+						option.WithMetavar(
+							option.NewStringOption(
+								's',
+								"search-type",
+								"Which registration records to read. Each is a search of its own and "+
+									"bills as one.",
+								false,
+								&settings.searchType,
+							),
+							"TYPE",
+						),
+						searchTypeCurrent,
+					),
+					searchTypeCurrent, searchTypeHistoric, searchTypeBoth,
 				),
 				option.NewBoolOption(
 					'j',
@@ -133,11 +180,28 @@ func runRelated(ctx context.Context, settings *relatedSettings) error {
 
 	// The two sources are independent, so one without a key does not stop the other.
 	if whoisXmlKey != "" {
-		domains, err := finder.ReverseWhois(ctx, settings.domain, settings.historical)
+		chosen := searchTypes(settings.searchType)
+
+		domains, err := finder.ReverseWhois(ctx, settings.domain, chosen)
 		if err != nil {
 			return fmt.Errorf("reverse whois: %w", err)
 		}
 		found = append(found, domains...)
+
+		// The party's own name, which finds what a redacted registrant address cannot. It runs
+		// after the address search rather than beside it because the two share a rate limit that
+		// counts wildcard searches by the minute, and because a domain both of them found should
+		// carry both reasons rather than whichever arrived first.
+		organizationDomains, err := finder.ReverseWhoisOrganization(
+			ctx,
+			settings.domain,
+			settings.organization,
+			chosen,
+		)
+		if err != nil {
+			return fmt.Errorf("reverse whois organization: %w", err)
+		}
+		found = append(found, organizationDomains...)
 	}
 
 	if hackerTargetKey != "" {
@@ -149,6 +213,16 @@ func runRelated(ctx context.Context, settings *relatedSettings) error {
 	}
 
 	merged := related.Merge(found...)
+
+	// What the DNS says about the domains the registration searches turned up. It reaches no
+	// registry and spends nothing, and it is the one check available on an answer that arrives as a
+	// list of bare names: a domain served from the same nameservers as the searched domain, or from
+	// a set a group of the others share, has been placed there by something other than the search
+	// that found it. It adds no domains and removes none.
+	merged, err = finder.Corroborate(ctx, settings.domain, merged)
+	if err != nil {
+		return fmt.Errorf("corroborate: %w", err)
+	}
 
 	if settings.asJson {
 		return emit(merged)

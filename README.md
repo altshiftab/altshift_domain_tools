@@ -23,8 +23,9 @@ What can be learned about a domain from outside it.
 | `pkg/network_range/reverse` | Whose reverse DNS is this block delegated to? |
 | `pkg/cidr` | An address range as the prefixes that cover it |
 | `pkg/email` | Is this registered address at the domain? |
+| `pkg/organization` | Is this party's name worth searching a registry on? |
 | `pkg/inference` | How something was found, and what that is worth |
-| `pkg/resolver` | Does this name resolve, and why not |
+| `pkg/resolver` | Does this name resolve, where does it point, and why not |
 
 Each source is a `Client` built from a config package of its own -- `crtsh_config`, and so on --
 carrying a base URL and the fetch options every call it makes is given. The two finders take the
@@ -41,7 +42,7 @@ go install github.com/altshiftab/altshift_domain_tools/cmd/altshift_domain_tools
 
 ```
 altshift_domain_tools subdomains [-b] [-r ADDRESS] [-c N] [-j] DOMAIN
-altshift_domain_tools related    [-w PATH] [-t PATH] [-H] [-j] DOMAIN
+altshift_domain_tools related    [-w PATH] [-t PATH] [-o NAME] [-s TYPE] [-j] DOMAIN
 altshift_domain_tools ranges     [-j] DOMAIN
 ```
 
@@ -98,7 +99,7 @@ subdomainFinder := finder.NewFinder(
 ```go
 relatedFinder := related.NewFinder(related_config.WithWhoisXmlApiKey(apiKey))
 
-domains, err := relatedFinder.ReverseWhois(ctx, "example.com", false)
+domains, err := relatedFinder.ReverseWhois(ctx, "example.com", nil)
 ```
 
 Each domain carries the inferences that attributed it, with a confidence: a registration record
@@ -106,6 +107,115 @@ naming the same party is worth more than sharing an address. An address serving 
 `DefaultSharedHostingDomainLimit` domains is discarded, because everything on shared hosting would
 otherwise be attributed to everything else. `related_config.WithSharedHostingDomainLimit` overrides
 it.
+
+Reverse whois bills, so a search is previewed before it is bought. A preview costs nothing and
+answers with a count, which is what decides whether the purchase is worth making: a term matching
+nothing is not bought, and neither is one matching more than `DefaultReverseWhoisMatchLimit`, which
+has stopped describing one party and started describing a privacy service or a registrar. The count
+stops at ten thousand -- the addresses at `google.com` preview as ten thousand whatever the true
+number is -- so that is where the limit sits, and a term reaching it has said only that it matched
+too much to count. `related_config.WithReverseWhoisMatchLimit` raises it, and a purchase then reads
+as many pages as the limit allows, one credit each. What a run cannot do is return part of an answer
+and let it pass for the whole of one: a search too big for the budget is left unbought and said so,
+and a walk that stops early says that too.
+
+### Which records to read
+
+The registry keeps two sets, and they answer different questions at the same price. The historic
+records hold what redaction has since taken out of the current ones -- `kivra.com` matches no
+address in the current records and thirty-seven in the historic -- so they are worth sweeping once
+for a domain. The current records are what a domain looks like now, and are what a monitor asks for
+again on every run.
+
+So the choice is the caller's, per call or on the finder, and `DefaultSearchTypes` is the current
+records alone: reading both by default would have every repeat buy the past over again.
+
+```go
+// Once, when a domain is first looked at.
+domains, err := relatedFinder.ReverseWhois(ctx, "kivra.com", []string{whoisxml.SearchTypeCurrent, whoisxml.SearchTypeHistoric})
+
+// And thereafter, on a finder built for monitoring.
+relatedFinder := related.NewFinder(
+    related_config.WithWhoisXmlApiKey(apiKey),
+    related_config.WithSearchTypes(whoisxml.SearchTypeCurrent),
+)
+```
+
+A match in the historic records is worth one step less than the same match in the current ones,
+because the package claims present ownership. One step and not two: redaction means the past is
+frequently the only place the evidence survives, so a historic-only match is often a current domain
+whose record went dark rather than one the party let go. Both are the same `Method` -- two search
+types are one search against two copies of one registry, not two methods agreeing, and separating
+them would have `Combined` raise every domain that appears in both.
+
+A term that fails does not take the others with it. What the others bought is kept and the failure
+is logged, because a purchase already billed is not worth discarding; every term failing is returned
+as an error, since that is the key or the API rather than a domain with no relations. The same holds
+for reverse IP, where one address failing does not discard what the others found.
+
+The DNS both halves reach for is an interface apiece in `pkg/resolver`, narrow and separate because
+they ask different questions: `AddressResolver` for where a domain is hosted, which is where the
+reverse-IP search starts, and `NameServerResolver` for where its DNS is served from, which is what
+the corroboration check compares. A caller already holding a client passes it -- `net.DefaultResolver`
+satisfies both as it stands, and is the fallback -- and a test passes a table, so neither search
+needs the network to be tested.
+
+### The organisation pivot
+
+```go
+domains, err := relatedFinder.ReverseWhoisOrganization(ctx, "kivra.com", "", nil)
+```
+
+Most gTLD registrations made since 2018 carry no registrant e-mail, so the address search finds
+nothing for them however many domains the party holds: `kivra.com` matches none, and its
+organisation matches seventeen. This is the search that finds those, over the registrant
+organisation and the registrant contact name.
+
+It is weaker evidence and is recorded as such. The registry walks in `pkg/network_range` keep an
+organisation only where its own contacts carry an address at the domain, because a name is a poor
+thing to attribute on; here the API answers with bare domain names and there is nothing to check
+them against. So results carry `MethodReverseWhoisOrganization` at `ConfidenceFair`, below what an
+address at the domain is worth -- a separate method rather than a weaker grade of the same one, so
+that a domain both pivots found still outranks one either found alone.
+
+Two gates stand in for the check that cannot be made. The name is judged before it is searched:
+`pkg/organization` strips the company form and the words every company shares, and rejects what is
+left if it is under `organization.MinimumLength` letters or is nothing but those shared words --
+`Data Group AB` identifies nobody, and `Kivra AB` is searched for as `Kivra`, the shorter substring
+matching strictly more. The count is judged before it is bought, against
+`DefaultReverseWhoisOrganizationMatchLimit`, which sits far below the address search's because a
+name matches far more loosely: a portfolio is seventeen domains, or a few hundred; a term matching
+thousands has matched the language rather than the company.
+
+An organisation name of `""` is guessed from the domain's own label, which is what most parties are
+registered under. A guess that fails the name gate is dropped with a warning; a name the caller
+named and that fails it is an error, the caller having asked for something that cannot be done.
+
+### Corroboration
+
+```go
+domains, err = relatedFinder.Corroborate(ctx, "kivra.com", domains)
+```
+
+A reverse-whois answer is a list of bare names, so there is no registrant to check against the
+party. The DNS is the one thing about those names that can be read without asking the API, and
+`Corroborate` reads it: a domain served from the same nameservers as the searched domain, or from a
+set that `DefaultNameServerClusterSize` of the others share, has been placed there by something
+other than the search that found it. It costs no credits and reaches no registry.
+
+It records `MethodSharedNameServers` at `ConfidenceModest` rather than filtering, so `Combined`
+raises what two independent things agree on and leaves the rest where it was. Nothing is removed --
+a domain with no delegation is one this has nothing to say about, not one shown to be unrelated.
+
+A set belonging to a large provider is discarded outright, because it identifies nobody: Cloud DNS
+hands each zone one of a few dozen fixed sets between millions of zones, so two zones carrying the
+same four names have been shown to share nothing. That is conservative on purpose, and it costs
+real matches -- a party whose own DNS is on such a provider gets no corroboration for the domains
+that genuinely sit beside it.
+
+On `kivra.com` the split is the useful one: the nineteen domains its brand-protection registrar
+holds -- the country registrations and the typo defensives alike -- rise to 4, and the three that
+merely contain the word `kivra` stay at 3.
 
 ## Network ranges
 

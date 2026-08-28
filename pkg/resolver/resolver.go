@@ -150,3 +150,31 @@ func (client *Client) DomainExists(ctx context.Context, domain string) (bool, er
 		)
 	}
 }
+
+// NameServerResolver reads a domain's nameservers.
+//
+// It is separate from Resolver, and narrow, because the two answer different questions for
+// different callers: the brute force asks whether a name exists, thousands of times, and the
+// related-domain check asks where one domain's DNS is served from, to see whether it is served from
+// the same place as another's. Nothing has to answer both.
+//
+// net.DefaultResolver satisfies this as it stands, which is what a caller holding no client gets.
+//
+// An implementation must be safe for concurrent use: the check calls it for every domain a search
+// found, several at a time.
+type NameServerResolver interface {
+	LookupNS(ctx context.Context, name string) ([]*net.NS, error)
+}
+
+// AddressResolver reads the addresses a domain resolves to.
+//
+// The third of the narrow interfaces here, and separate for the same reason as the second: the
+// reverse-IP search asks where a domain is hosted, which is neither of the questions the other two
+// ask, and nothing has to answer more than one of them.
+//
+// net.DefaultResolver satisfies this as it stands, which is what a caller holding no client gets.
+//
+// An implementation must be safe for concurrent use.
+type AddressResolver interface {
+	LookupIP(ctx context.Context, network string, host string) ([]net.IP, error)
+}
