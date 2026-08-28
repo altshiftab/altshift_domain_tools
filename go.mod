@@ -3,7 +3,7 @@ module github.com/altshiftab/altshift_domain_tools
 go 1.27
 
 require (
-	github.com/altshiftab/utils_go v1.37.0
+	github.com/altshiftab/utils_go v1.41.0
 	github.com/miekg/dns v1.1.72
 	golang.org/x/sync v0.19.0
 )

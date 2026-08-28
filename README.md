@@ -40,6 +40,13 @@ altshift_domain_tools ranges     [-j] DOMAIN
 One item per line by default, so a run pipes into whatever comes next the way the shell scripts this
 replaces did; `--json` adds how each result was found and what that is worth.
 
+Completions come from the parser's own declaration, so they cannot disagree with what the program
+accepts:
+
+```
+altshift_domain_tools --completion zsh > ~/.zsh/completions/_altshift_domain_tools
+```
+
 `ranges` needs no credentials at all. `related` reads its keys from a file (`-w`, `-t`) or from
 `WHOISXML_API_KEY` and `HACKERTARGET_API_KEY` -- there is deliberately no flag taking a key itself,
 because an argument is visible in the process table to every user on the machine.
