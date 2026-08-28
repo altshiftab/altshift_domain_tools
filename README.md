@@ -13,14 +13,17 @@ What can be learned about a domain from outside it.
 | `pkg/sources/whoisxml` | Reverse whois |
 | `pkg/subdomain/brute` | Wordlist brute force over DNS |
 | `pkg/subdomain/wordlist` | The embedded default list |
+| `pkg/network_range` | What address space does this owner hold? `192.0.2.0/24` |
+| `pkg/sources/ripe` | Registry contacts and their allocations |
+| `pkg/inference` | How something was found, and what that is worth |
 | `pkg/resolver` | Does this name resolve, and why not |
 
 Each source is a `Client` built from a config package of its own -- `crtsh_config`, and so on --
 carrying a base URL and the fetch options every call it makes is given. The two finders take the
 same shape, and hold the source clients they use.
 
-The two halves answer different questions and share no sources but HackerTarget, which serves both
-through different endpoints. Neither finds what the other does.
+The three halves answer different questions and share no sources but HackerTarget, which serves two
+of them through different endpoints. None finds what the others do.
 
 ## Subdomains
 
@@ -67,8 +70,38 @@ naming the same party is worth more than sharing an address. An address serving 
 otherwise be attributed to everything else. `related_config.WithSharedHostingDomainLimit` overrides
 it.
 
+## Network ranges
+
+```go
+rangeFinder := finder.NewFinder()
+
+ranges, err := rangeFinder.Find(ctx, "example.com")
+```
+
+Two sources, run together. The registry knows what a party was *allocated*, including space it is
+not using; the domain's SPF record declares what it *sends from*, including space it uses under
+someone else's allocation. Neither is a superset of the other.
+
+The SPF walk follows `include:` and `redirect:` only within the same registered domain. Without
+that, a domain whose record says `include:_spf.google.com` would contribute Google's entire mail
+estate to its owner -- wrong, and enormous.
+
+RIPE covers Europe, the Middle East and Central Asia, so an empty answer is not evidence that a
+party holds nothing.
+
+## Inference
+
+Everything here is inferred rather than known, and the kinds of evidence are not worth the same. So
+a discovered thing carries the inferences that produced it -- a method, a confidence, and the steps
+behind it -- rather than a bare boolean.
+
+`inference.Combined` is the strongest of them, raised by one where two or more *distinct* methods
+agree, capped at the top of the scale. The conservatism is deliberate: five reverse-IP hits are one
+piece of evidence seen five times, because they all come from the same shared host, and summing them
+would make co-location look like proof.
+
 ## Credentials
 
-`crtsh` needs none. HackerTarget's host search is metered anonymously and reports what is left of
-the allowance; its reverse IP lookup and WhoisXML both need keys, which are given to
-`related.NewFinder` rather than passed per call.
+`crtsh`, `ripe` and the SPF walk need none. HackerTarget's host search is metered anonymously and
+reports what is left of the allowance; its reverse IP lookup and WhoisXML both need keys, which are
+given to `related.NewFinder` rather than passed per call.

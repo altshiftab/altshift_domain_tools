@@ -20,6 +20,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/altshiftab/altshift_domain_tools/pkg/inference"
 	"github.com/altshiftab/altshift_domain_tools/pkg/related/related_config"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/hackertarget"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/whoisxml"
@@ -32,10 +33,16 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// The confidence each source is worth, on a one-to-five scale.
+// The methods this package attributes a domain by, and what each is worth.
+//
+// They differ by an order of magnitude in what they prove: a registration record naming the same
+// party is someone stating the relationship, while sharing an address is a fact about a web host.
 const (
-	ReverseWhoisConfidence = 4
-	ReverseIpConfidence    = 2
+	MethodReverseWhois inference.Method = "reverse whois"
+	MethodReverseIp    inference.Method = "reverse ip"
+
+	ReverseWhoisConfidence = inference.ConfidenceStrong
+	ReverseIpConfidence    = inference.ConfidenceWeak
 )
 
 // DefaultSharedHostingDomainLimit bounds how many domains one address may map to before the
@@ -49,22 +56,24 @@ var excludedRegisteredDomains = map[string]struct{}{
 	"googleusercontent.com": {},
 }
 
-// Inference is one reason a domain was attributed, with a confidence and the steps that produced
-// it -- for example "reverse whois" followed by the search term that matched.
-type Inference struct {
-	Confidence int      `json:"confidence"`
-	Chain      []string `json:"chain"`
-}
-
 // Domain is one attributed domain and why.
 //
 // It is deliberately lean. The domain security assessment carries a far larger type for the same
 // name, holding its DMARC, SPF and DKIM; a discovery run has learned none of that, and a type that
 // claimed the fields would be mostly empty.
 type Domain struct {
-	Domain           string       `json:"domain"`
-	RegisteredDomain string       `json:"registered_domain,omitzero"`
-	Inferences       []*Inference `json:"inferences,omitzero"`
+	Domain           string                 `json:"domain"`
+	RegisteredDomain string                 `json:"registered_domain,omitzero"`
+	Inferences       []*inference.Inference `json:"inferences,omitzero"`
+}
+
+// Confidence is what the domain's inferences are worth together.
+func (domain *Domain) Confidence() inference.Confidence {
+	if domain == nil {
+		return 0
+	}
+
+	return inference.Combined(domain.Inferences)
 }
 
 // Merge collapses domains naming the same host, keeping the union of their inferences so a domain
@@ -83,7 +92,7 @@ func Merge(domains ...*Domain) []*Domain {
 			continue
 		}
 
-		existing.Inferences = append(existing.Inferences, domain.Inferences...)
+		existing.Inferences = inference.Merge(append(existing.Inferences, domain.Inferences...))
 	}
 
 	found := slices.Collect(maps.Values(merged))
@@ -244,8 +253,10 @@ func (finder *Finder) ReverseWhois(
 				}
 
 				found = append(found, &Domain{
-					Domain:     name,
-					Inferences: []*Inference{{Confidence: ReverseWhoisConfidence, Chain: []string{"reverse whois", term}}},
+					Domain: name,
+					Inferences: []*inference.Inference{
+						inference.New(MethodReverseWhois, ReverseWhoisConfidence, term),
+					},
 				})
 			}
 
@@ -333,8 +344,8 @@ func (finder *Finder) ReverseIp(
 				found = append(found, &Domain{
 					Domain:           name,
 					RegisteredDomain: name,
-					Inferences: []*Inference{
-						{Confidence: ReverseIpConfidence, Chain: []string{"reverse ip", address.String()}},
+					Inferences: []*inference.Inference{
+						inference.New(MethodReverseIp, ReverseIpConfidence, address.String()),
 					},
 				})
 			}

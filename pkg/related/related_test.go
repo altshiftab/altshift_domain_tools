@@ -4,6 +4,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/altshiftab/altshift_domain_tools/pkg/inference"
 	"github.com/altshiftab/altshift_domain_tools/pkg/related/related_config"
 )
 
@@ -13,9 +14,18 @@ func TestMerge(t *testing.T) {
 	// The same domain found by both sources keeps both reasons, so a consumer can see it was
 	// attributed twice rather than once.
 	merged := Merge(
-		&Domain{Domain: "example.net", Inferences: []*Inference{{Confidence: ReverseWhoisConfidence, Chain: []string{"reverse whois"}}}},
-		&Domain{Domain: "example.net", Inferences: []*Inference{{Confidence: ReverseIpConfidence, Chain: []string{"reverse ip"}}}},
-		&Domain{Domain: "example.org", Inferences: []*Inference{{Confidence: ReverseIpConfidence}}},
+		&Domain{
+			Domain:     "example.net",
+			Inferences: []*inference.Inference{inference.New(MethodReverseWhois, ReverseWhoisConfidence, "a@b")},
+		},
+		&Domain{
+			Domain:     "example.net",
+			Inferences: []*inference.Inference{inference.New(MethodReverseIp, ReverseIpConfidence, "192.0.2.1")},
+		},
+		&Domain{
+			Domain:     "example.org",
+			Inferences: []*inference.Inference{inference.New(MethodReverseIp, ReverseIpConfidence)},
+		},
 		&Domain{Domain: ""},
 		nil,
 	)
@@ -32,6 +42,16 @@ func TestMerge(t *testing.T) {
 	if len(merged[0].Inferences) != 2 {
 		t.Errorf("expected both reasons to be kept, got %d", len(merged[0].Inferences))
 	}
+
+	// Two independent methods agreeing is worth more than either alone, but only by one step: the
+	// evidence is not additive.
+	if got := merged[0].Confidence(); got != ReverseWhoisConfidence+1 {
+		t.Errorf("expected two methods to raise the confidence by one, got %d", got)
+	}
+	// One method on its own is worth exactly what it is worth.
+	if got := merged[1].Confidence(); got != ReverseIpConfidence {
+		t.Errorf("expected a single method to stand at its own confidence, got %d", got)
+	}
 }
 
 // TestConfidences holds the weighting the two sources are worth. A registration record naming the
@@ -47,9 +67,10 @@ func TestConfidences(t *testing.T) {
 			ReverseIpConfidence,
 		)
 	}
-	for _, confidence := range []int{ReverseWhoisConfidence, ReverseIpConfidence} {
-		if confidence < 1 || confidence > 5 {
-			t.Errorf("expected a confidence on the one-to-five scale, got %d", confidence)
+	// The scale is the shared one, so a value off it is a mistake rather than a grade.
+	for _, confidence := range []inference.Confidence{ReverseWhoisConfidence, ReverseIpConfidence} {
+		if !confidence.Valid() {
+			t.Errorf("expected a confidence on the scale, got %d", confidence)
 		}
 	}
 }
