@@ -150,6 +150,65 @@ func TestCoverIsExact(t *testing.T) {
 	}
 }
 
+// TestPrefixes holds the other two forms a registry writes an allocation in. A v6 allocation is a
+// prefix rather than two addresses and a range of one address is written as the address, so a
+// caller reading allocations meets all three and should not have to tell them apart.
+func TestPrefixes(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name        string
+		text        string
+		expect      []string
+		expectError bool
+	}{
+		{name: "a v6 prefix", text: "2001:db8::/32", expect: []string{"2001:db8::/32"}},
+		{name: "a v4 prefix", text: "192.0.2.0/24", expect: []string{"192.0.2.0/24"}},
+		{name: "a single v4 address", text: "192.0.2.1", expect: []string{"192.0.2.1/32"}},
+		{name: "a single v6 address", text: "2001:db8::1", expect: []string{"2001:db8::1/128"}},
+		{name: "space around it", text: "  192.0.2.0/24 ", expect: []string{"192.0.2.0/24"}},
+		{
+			// A registry does not write one, but a caller passing one on should get the network
+			// rather than an address inside it.
+			name:   "a prefix with host bits set",
+			text:   "192.0.2.5/24",
+			expect: []string{"192.0.2.0/24"},
+		},
+		{
+			// The v4 address it wraps, so that it covers as one rather than as a v6 /128.
+			name:   "a v4 address written as v6",
+			text:   "::ffff:192.0.2.1",
+			expect: []string{"192.0.2.1/32"},
+		},
+		{name: "not an address at all", text: "nonsense", expectError: true},
+		{name: "a range rather than a prefix", text: "10.0.0.1 - 10.0.0.6", expectError: true},
+		{name: "nothing", text: "", expectError: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := Prefixes(testCase.text)
+
+			if testCase.expectError {
+				if !errors.Is(err, ErrMalformedRange) {
+					t.Fatalf("%s: expected a malformed range, got %v", testCase.name, err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("%s: unexpected error: %v", testCase.name, err)
+			}
+			if !slices.Equal(got, testCase.expect) {
+				t.Errorf("%s: expected %v, got %v", testCase.name, testCase.expect, got)
+			}
+		})
+	}
+}
+
 func TestStrings(t *testing.T) {
 	t.Parallel()
 

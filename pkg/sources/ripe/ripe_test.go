@@ -178,6 +178,32 @@ func TestRegistrantsReadsRolesAndOrganizations(t *testing.T) {
 	}
 }
 
+// TestOrganizations holds the convenience the other half of a search deserves. Registrants answers
+// with both kinds of object, and a caller wanting one of them should not have to sort them itself.
+func TestOrganizations(t *testing.T) {
+	t.Parallel()
+
+	client := serverClient(t, func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		body := `{"result":{"numFound":2,"docs":[` +
+			person("AA1-RIPE", "A Person", "someone@example.com") + "," +
+			organization("ORG-EX1-RIPE", "Example Ltd", "ripe@example.com") +
+			`]}}`
+		if _, err := fmt.Fprint(writer, body); err != nil {
+			t.Errorf("could not write: %v", err)
+		}
+	})
+
+	organizations, err := client.Organizations(t.Context(), "example.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(organizations) != 1 || organizations[0].Handle != "ORG-EX1-RIPE" {
+		t.Errorf("expected the organisation alone, got %+v", organizations)
+	}
+}
+
 // TestOrganizationRanges holds the other inverse search. An inetnum's org is the party that holds
 // it, where its administrative and technical contacts may be a provider's staff.
 func TestOrganizationRanges(t *testing.T) {
