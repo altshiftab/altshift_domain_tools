@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
@@ -22,13 +23,17 @@ import (
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/rdap/rdap_config"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripe"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripe/ripe_config"
+	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripestat"
+	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripestat/ripestat_config"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/whois"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/whois/whois_config"
 	"github.com/altshiftab/utils_go/pkg/http/types/fetch_config"
 )
 
 type stubResolver struct {
-	records map[string][]string
+	records     map[string][]string
+	nameServers map[string][]string
+	addresses   map[string][]string
 
 	lock sync.Mutex
 }
@@ -43,6 +48,43 @@ func (stub *stubResolver) LookupTXT(_ context.Context, name string) ([]string, e
 	}
 
 	return records, nil
+}
+
+// The reverse-delegation walk asks for these, and the stub answers with nothing rather than leaving
+// the finder to fall back on the real resolver -- which would have every run of the test suite
+// query the DNS about whatever the test made up.
+func (stub *stubResolver) LookupNS(_ context.Context, name string) ([]*net.NS, error) {
+	stub.lock.Lock()
+	defer stub.lock.Unlock()
+
+	nameServers, ok := stub.nameServers[name]
+	if !ok {
+		return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+	}
+
+	found := make([]*net.NS, 0, len(nameServers))
+	for _, host := range nameServers {
+		found = append(found, &net.NS{Host: host})
+	}
+
+	return found, nil
+}
+
+func (stub *stubResolver) LookupNetIP(_ context.Context, _ string, host string) ([]netip.Addr, error) {
+	stub.lock.Lock()
+	defer stub.lock.Unlock()
+
+	addresses, ok := stub.addresses[host]
+	if !ok {
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+
+	found := make([]netip.Addr, 0, len(addresses))
+	for _, address := range addresses {
+		found = append(found, netip.MustParseAddr(address))
+	}
+
+	return found, nil
 }
 
 // newFinder stands the registries up on a test server and gives the walk a stubbed resolver.
@@ -76,6 +118,12 @@ func newFinder(t *testing.T, handler http.HandlerFunc, records map[string][]stri
 		finder_config.WithRdap(MethodApnic, rdap.NewClient(
 			rdap_config.WithBaseUrl(serverUrl),
 			rdap_config.WithFetchOptions(fetch_config.WithHttpClient(server.Client())),
+		)),
+		// Pointed at the server even where a test turns up no networks to ask about, because a
+		// fixture that later does would otherwise reach the live service without anyone noticing.
+		finder_config.WithRipestat(ripestat.NewClient(
+			ripestat_config.WithBaseUrl(serverUrl),
+			ripestat_config.WithFetchOptions(fetch_config.WithHttpClient(server.Client())),
 		)),
 		finder_config.WithResolver(&stubResolver{records: records}),
 	)
@@ -485,6 +533,97 @@ func TestFindSurvivesOneRouteFailing(t *testing.T) {
 	}
 }
 
+// TestFindFollowsTheNetworksToTheirPrefixes holds the second axis. An allocation is what a party was
+// given and a prefix is what its network routes, and space routed under someone else's allocation
+// appears only here -- so the registry answer and the routing answer are different sets.
+func TestFindFollowsTheNetworksToTheirPrefixes(t *testing.T) {
+	t.Parallel()
+
+	rangeFinder := newFinder(
+		t,
+		func(writer http.ResponseWriter, request *http.Request) {
+			path := request.URL.Path
+			write := func(body string) {
+				writer.Header().Set("Content-Type", "application/json")
+				if _, err := fmt.Fprint(writer, body); err != nil {
+					t.Errorf("could not write: %v", err)
+				}
+			}
+
+			switch {
+			case strings.HasPrefix(path, "/rest/"), strings.HasPrefix(path, "/entities"),
+				strings.HasPrefix(path, "/entity/"):
+				writer.WriteHeader(http.StatusNotFound)
+			case strings.Contains(path, "fulltextsearch"):
+				write(`{"result":{"docs":[{"doc":{"strs":[
+					{"str":{"name":"nic-hdl","value":"AA1-RIPE"}},
+					{"str":{"name":"e-mail","value":"ops@example.com"}}
+				]}}]}}`)
+			case strings.Contains(path, ripestat.RoasPath):
+				write(`{"data":{"roas":[{"asn":"64500","prefix":"192.0.2.0/24","maxLength":24,"ta":"RIPE NCC RPKI Root"}]}}`)
+			case strings.Contains(path, ripestat.AnnouncedPrefixesPath):
+				// Announced but not authorised, which is the case the two answers differ on.
+				write(`{"data":{"prefixes":[{"prefix":"192.0.2.0/24"},{"prefix":"198.51.100.0/24"}]}}`)
+			case strings.Contains(request.URL.RawQuery, "aut-num"):
+				write(`{"objects":{"object":[{"attributes":{"attribute":[
+					{"name":"aut-num","value":"AS64500"},
+					{"name":"as-name","value":"EXAMPLE-AS"}
+				]}}]}}`)
+			case strings.Contains(request.URL.RawQuery, "route"):
+				write(`{"objects":{"object":[{"attributes":{"attribute":[
+					{"name":"route","value":"203.0.113.0/24"},
+					{"name":"origin","value":"AS64500"}
+				]}}]}}`)
+			default:
+				write(`{"objects":{"object":[{"attributes":{"attribute":[
+					{"name":"inetnum","value":"10.0.0.0 - 10.0.0.255"},
+					{"name":"netname","value":"EXAMPLE-NET"}
+				]}}]}}`)
+			}
+		},
+		nil,
+	)
+
+	ranges, err := rangeFinder.Find(t.Context(), "example.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	networks := networksOf(ranges)
+	for _, expected := range []string{"10.0.0.0/24", "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"} {
+		if !slices.Contains(networks, expected) {
+			t.Errorf("expected %s, got %v", expected, networks)
+		}
+	}
+
+	byNetwork := make(map[string]*Range, len(ranges))
+	for _, item := range ranges {
+		byNetwork[item.Network] = item
+	}
+
+	// The authorisation and the announcement are separate methods, so the prefix both name is worth
+	// more than either alone -- which is the point of keeping them apart.
+	both := byNetwork["192.0.2.0/24"]
+	if both == nil || len(inference.Methods(both.Inferences)) != 2 {
+		t.Fatalf("expected the prefix both name to carry both, got %+v", both)
+	}
+	if both.Confidence() != RpkiConfidence+1 {
+		t.Errorf("expected agreement to raise the confidence, got %d", both.Confidence())
+	}
+
+	// Announced and not authorised is an observation, and a transit provider makes it about its
+	// customers' space as readily as about its own.
+	announced := byNetwork["198.51.100.0/24"]
+	if announced == nil || announced.Confidence() != BgpConfidence {
+		t.Errorf("expected an announcement alone to be worth less, got %+v", announced)
+	}
+
+	if declared := byNetwork["203.0.113.0/24"]; declared == nil ||
+		!slices.Contains(inference.Methods(declared.Inferences), MethodRouteObject) {
+		t.Errorf("expected the route object's prefix, got %+v", declared)
+	}
+}
+
 // TestFindSurvivesASourceFailing holds that the sources are independent: the registry being down
 // must not cost the answers of the mail policy.
 func TestFindSurvivesASourceFailing(t *testing.T) {
@@ -567,5 +706,106 @@ func TestFindArgumentChecks(t *testing.T) {
 	var nilRange *Range
 	if got := nilRange.Confidence(); got != 0 {
 		t.Errorf("expected a nil range to have no confidence, got %d", got)
+	}
+}
+
+// TestTenureFromStatus holds the distinction the registries word differently and mean the same by.
+// A party with an address inside a provider's block has that address and does not hold the block.
+func TestTenureFromStatus(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name   string
+		status string
+		expect Tenure
+	}{
+		// RIPE says it as provider-aggregatable against provider-independent.
+		{name: "assigned inside another allocation", status: "ASSIGNED PA", expect: TenureUsed},
+		{name: "sub-allocated", status: "SUB-ALLOCATED PA", expect: TenureUsed},
+		{name: "provider independent", status: "ASSIGNED PI", expect: TenureHeld},
+		// An LIR's own allocation is the thing it was given.
+		{name: "an allocation of the party's own", status: "ALLOCATED PA", expect: TenureHeld},
+		{name: "allocated provider independent", status: "ALLOCATED PI", expect: TenureHeld},
+		{name: "legacy space", status: "LEGACY", expect: TenureHeld},
+		{name: "anycast", status: "ASSIGNED ANYCAST", expect: TenureHeld},
+		// APNIC and AFRINIC say it outright.
+		{name: "portable", status: "ALLOCATED PORTABLE", expect: TenureHeld},
+		{name: "assigned portable", status: "ASSIGNED PORTABLE", expect: TenureHeld},
+		{name: "non-portable", status: "ALLOCATED NON-PORTABLE", expect: TenureUsed},
+		{name: "assigned non-portable", status: "ASSIGNED NON-PORTABLE", expect: TenureUsed},
+		{name: "lower case", status: "assigned pa", expect: TenureUsed},
+		// The v6 statuses say who handed the space over. ALLOCATED-BY-LIR opens like an allocation
+		// of the party's own and is the opposite of one, which is why the order matters.
+		{name: "allocated by the registry", status: "ALLOCATED-BY-RIR", expect: TenureHeld},
+		{name: "allocated by a provider", status: "ALLOCATED-BY-LIR", expect: TenureUsed},
+		{name: "aggregated by a provider", status: "AGGREGATED-BY-LIR", expect: TenureUsed},
+		{name: "a bare v6 assignment", status: "ASSIGNED", expect: TenureUsed},
+		// Most sources say nothing: an announcement and a mail policy describe use, not title.
+		{name: "nothing said", status: "", expect: TenureUnknown},
+		{name: "something else entirely", status: "SOMETHING", expect: TenureUnknown},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := TenureFromStatus(testCase.status); got != testCase.expect {
+				t.Errorf("%s: expected %q, got %q", testCase.name, testCase.expect, got)
+			}
+		})
+	}
+}
+
+// TestCollapseKeepsTheStrongerTenure holds that a range held inside one only used is still held: the
+// containing range is the extent of what the party was given, and the narrower claim cannot weaken
+// it.
+func TestCollapseKeepsTheStrongerTenure(t *testing.T) {
+	t.Parallel()
+
+	collapsed := Collapse([]*Range{
+		{Network: "10.0.0.0/16", Tenure: TenureUsed, Inferences: []*inference.Inference{
+			inference.New(MethodRipe, RipeConfidence),
+		}},
+		{Network: "10.0.1.0/24", Tenure: TenureHeld, Inferences: []*inference.Inference{
+			inference.New(MethodArin, ArinConfidence),
+		}},
+	})
+
+	if len(collapsed) != 1 {
+		t.Fatalf("expected one range, got %d", len(collapsed))
+	}
+	if collapsed[0].Tenure != TenureHeld {
+		t.Errorf("expected the stronger claim kept, got %q", collapsed[0].Tenure)
+	}
+}
+
+// TestFindMarksTenure holds that what a registry said about who holds a range reaches the answer. It
+// is what lets a consumer tell space a party owns from an address it rents inside somebody else's.
+func TestFindMarksTenure(t *testing.T) {
+	t.Parallel()
+
+	rangeFinder := newFinder(
+		t,
+		registryHandler(t, "192.0.2.0 - 192.0.2.255"),
+		map[string][]string{"example.com": {"v=spf1 ip4:198.51.100.0/24 -all"}},
+	)
+
+	ranges, err := rangeFinder.Find(t.Context(), "example.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	byNetwork := make(map[string]*Range, len(ranges))
+	for _, item := range ranges {
+		byNetwork[item.Network] = item
+	}
+
+	// The registry said ASSIGNED PA, which is an address inside an allocation somebody else holds.
+	if got := byNetwork["192.0.2.0/24"]; got == nil || got.Tenure != TenureUsed {
+		t.Errorf("expected the registry's claim read, got %+v", got)
+	}
+	// A mail policy describes use rather than title, and says nothing either way.
+	if got := byNetwork["198.51.100.0/24"]; got == nil || got.Tenure != TenureUnknown {
+		t.Errorf("expected nothing said about the declared range, got %+v", got)
 	}
 }

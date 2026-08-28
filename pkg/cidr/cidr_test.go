@@ -232,3 +232,121 @@ func TestCoverRejectsAnInvalidAddress(t *testing.T) {
 		t.Errorf("expected a malformed range, got %v", err)
 	}
 }
+
+// TestFromReverseZone holds how a zone name names a prefix. The address is written backwards under a
+// suffix, so the labels count the prefix's length as well as naming it.
+func TestFromReverseZone(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name        string
+		zone        string
+		expect      string
+		expectError bool
+	}{
+		{name: "a delegated /24", zone: "8.8.8.in-addr.arpa", expect: "8.8.8.0/24"},
+		// The boundary is whatever the holder took, which is a /16 as readily as a /24.
+		{name: "a delegated /16", zone: "10.193.in-addr.arpa", expect: "193.10.0.0/16"},
+		{name: "a delegated /8", zone: "193.in-addr.arpa", expect: "193.0.0.0/8"},
+		{name: "a single address", zone: "1.7.10.193.in-addr.arpa", expect: "193.10.7.1/32"},
+		{name: "a trailing dot", zone: "8.8.8.in-addr.arpa.", expect: "8.8.8.0/24"},
+		{name: "upper case", zone: "8.8.8.IN-ADDR.ARPA", expect: "8.8.8.0/24"},
+		{name: "a v6 zone", zone: "0.0.a.d.0.0.a.2.ip6.arpa", expect: "2a00:da00::/32"},
+		{
+			name:   "a v6 /48",
+			zone:   "0.0.0.0.0.0.7.4.6.0.6.2.ip6.arpa",
+			expect: "2606:4700::/48",
+		},
+		// A classless delegation names a range of addresses rather than a block, so it names no
+		// prefix of its own.
+		{name: "a classless delegation", zone: "0-25.2.0.192.in-addr.arpa", expectError: true},
+		{name: "a forward zone", zone: "example.com", expectError: true},
+		{name: "an octet past 255", zone: "300.2.0.192.in-addr.arpa", expectError: true},
+		{name: "too many labels", zone: "1.2.3.4.5.in-addr.arpa", expectError: true},
+		{name: "a v6 label that is not a nibble", zone: "ff.0.0.0.ip6.arpa", expectError: true},
+		{name: "nothing", zone: "", expectError: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := FromReverseZone(testCase.zone)
+
+			if testCase.expectError {
+				if !errors.Is(err, ErrMalformedRange) {
+					t.Fatalf("%s: expected a malformed range, got %v", testCase.name, err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("%s: unexpected error: %v", testCase.name, err)
+			}
+			if got != testCase.expect {
+				t.Errorf("%s: expected %q, got %q", testCase.name, testCase.expect, got)
+			}
+		})
+	}
+}
+
+// TestReverseZoneRoundTrip holds that the two directions agree, which is what lets a walk name a
+// zone and a registry object be read back as the prefix it delegates.
+func TestReverseZoneRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	for _, prefix := range []string{
+		"8.8.8.0/24", "193.10.0.0/16", "10.0.0.0/8", "203.0.113.9/32",
+		"2606:4700::/32", "2a00:da00::/48", "2001:db8::/64",
+	} {
+		zone, err := ReverseZone(netip.MustParsePrefix(prefix))
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", prefix, err)
+
+			continue
+		}
+
+		back, err := FromReverseZone(zone)
+		if err != nil {
+			t.Errorf("%s: could not read %q back: %v", prefix, zone, err)
+
+			continue
+		}
+
+		if back != prefix {
+			t.Errorf("%s: round tripped through %q to %q", prefix, zone, back)
+		}
+	}
+
+	// A prefix off a label boundary has no zone: a name is written a label at a time and can say
+	// nothing finer.
+	for _, prefix := range []string{"10.0.0.0/12", "10.0.0.0/0", "2001:db8::/33"} {
+		if _, err := ReverseZone(netip.MustParsePrefix(prefix)); !errors.Is(err, ErrMalformedRange) {
+			t.Errorf("%s: expected no zone, got %v", prefix, err)
+		}
+	}
+}
+
+// TestReverseZones holds the order a walk asks in: most specific first, because the delegation sits
+// at whatever boundary the holder took and the narrower answer is the better one.
+func TestReverseZones(t *testing.T) {
+	t.Parallel()
+
+	got := ReverseZones(netip.MustParseAddr("8.8.8.8"))
+	expect := []string{
+		"8.8.8.8.in-addr.arpa", "8.8.8.in-addr.arpa", "8.8.in-addr.arpa", "8.in-addr.arpa",
+	}
+	if !slices.Equal(got, expect) {
+		t.Errorf("expected %v, got %v", expect, got)
+	}
+
+	if got := ReverseZones(netip.Addr{}); got != nil {
+		t.Errorf("expected nothing for an address that is not one, got %v", got)
+	}
+
+	// A v4 address written as v6 is the v4 address it wraps, and its zones are v4 zones.
+	if got := ReverseZones(netip.MustParseAddr("::ffff:8.8.8.8")); !slices.Equal(got, expect) {
+		t.Errorf("expected the v4 zones, got %v", got)
+	}
+}

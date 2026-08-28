@@ -25,11 +25,13 @@ import (
 
 	"github.com/altshiftab/altshift_domain_tools/pkg/inference"
 	"github.com/altshiftab/altshift_domain_tools/pkg/network_range/finder/finder_config"
+	"github.com/altshiftab/altshift_domain_tools/pkg/network_range/reverse"
 	"github.com/altshiftab/altshift_domain_tools/pkg/network_range/spf"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/arin"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/rdap"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/rdap/rdap_config"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripe"
+	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripestat"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/whois"
 	altshiftContext "github.com/altshiftab/utils_go/pkg/context"
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
@@ -63,6 +65,33 @@ const (
 	AfrinicConfidence                  = inference.ConfidenceStrong
 )
 
+// The methods that attribute a range through a party's networks rather than through its
+// allocations, and what each is worth.
+//
+// They are a second axis, and it finds what the first cannot: an allocation is what a party was
+// given, a prefix is what its network authorises or announces, and space routed under someone
+// else's allocation appears only here. They are also the one route into the region no registry
+// search reaches, the routing data being global where a registry is not.
+const (
+	// MethodRpki is a route origin authorisation: the address holder signing, under RPKI, that the
+	// network may originate the prefix. A signed statement by the party is worth what a registry
+	// record is worth, and is rather harder to fake.
+	MethodRpki     inference.Method = "rpki authorisation"
+	RpkiConfidence                  = inference.ConfidenceStrong
+
+	// MethodRouteObject is the registry's own version of the same statement: the maintainer of the
+	// address space authorising a network to announce it.
+	MethodRouteObject     inference.Method = "route object"
+	RouteObjectConfidence                  = inference.ConfidenceStrong
+
+	// MethodBgp is an observation rather than a claim, and is worth less for a reason that matters:
+	// a transit provider originates its customers' space, so an announcement alone attributes a
+	// customer's addresses to its provider. It is evidence the prefix and the network belong
+	// together, not evidence of who holds the addresses.
+	MethodBgp     inference.Method = "bgp announcement"
+	BgpConfidence                  = inference.ConfidenceFair
+)
+
 // The steps an inference names where a range came from one of the two routes into a registry that
 // offers no search from a domain.
 const (
@@ -72,6 +101,68 @@ const (
 	ViaName = "name"
 )
 
+// Tenure is whether the party holds the address space or merely uses it.
+//
+// The two are different facts and both are worth having. A party with an address inside a provider's
+// block genuinely has that address -- reporting it is right -- but it cannot keep it, cannot route
+// it, and will be given another when the provider reassigns it. So the address is the party's today
+// and the block is the provider's always, and a consumer deciding what a party owns needs to be able
+// to tell the two apart.
+//
+// It matters most as a rule about what not to do: space a party only uses must never be expanded
+// from. Attributing one address inside a provider's block is correct; treating that address as an
+// anchor and taking the block around it would hand a customer its provider's entire estate, which is
+// the same mistake as following an SPF record into a mail provider.
+type Tenure string
+
+const (
+	// TenureUnknown is a range nothing said either way about. Most sources say nothing: a routing
+	// announcement and a mail policy describe use rather than title.
+	TenureUnknown Tenure = ""
+	// TenureHeld is space registered to the party itself, which it keeps and can route.
+	TenureHeld Tenure = "held"
+	// TenureUsed is space the party uses inside somebody else's allocation.
+	TenureUsed Tenure = "used"
+)
+
+// TenureFromStatus reads what a registry's status says about who holds the space.
+//
+// The registries word it differently and mean the same thing. RIPE writes provider-aggregatable
+// against provider-independent -- an ASSIGNED PA range sits inside an allocation somebody else
+// holds, where ASSIGNED PI is the party's own and portable. APNIC and AFRINIC say portable and
+// non-portable outright. An LIR's own ALLOCATED PA is held: the allocation is the thing it was
+// given.
+func TenureFromStatus(status string) Tenure {
+	status = strings.ToUpper(strings.TrimSpace(status))
+	if status == "" {
+		return TenureUnknown
+	}
+
+	switch {
+	case strings.Contains(status, "NON-PORTABLE"):
+		return TenureUsed
+	case strings.Contains(status, "PORTABLE"):
+		return TenureHeld
+	// The v6 statuses say who handed the space over, and an LIR passing space on is passing on part
+	// of an allocation it holds itself. The order matters: ALLOCATED-BY-LIR opens like an allocation
+	// of the party's own and is the opposite of one.
+	case strings.Contains(status, "BY-LIR"):
+		return TenureUsed
+	case strings.Contains(status, "BY-RIR"):
+		return TenureHeld
+	case strings.HasPrefix(status, "ASSIGNED PA"), strings.HasPrefix(status, "SUB-ALLOCATED"):
+		return TenureUsed
+	// A bare ASSIGNED is how v6 writes an end user's assignment out of an LIR's allocation.
+	case status == "ASSIGNED":
+		return TenureUsed
+	case strings.Contains(status, " PI"), strings.Contains(status, "LEGACY"),
+		strings.HasPrefix(status, "ALLOCATED"), strings.HasPrefix(status, "ASSIGNED ANYCAST"):
+		return TenureHeld
+	}
+
+	return TenureUnknown
+}
+
 // Range is one network attributed to the domain's owner.
 type Range struct {
 	// Network is the range in CIDR notation.
@@ -80,6 +171,8 @@ type Range struct {
 	NetName string `json:"net_name,omitzero"`
 	Status  string `json:"status,omitzero"`
 	Country string `json:"country,omitzero"`
+	// Tenure is whether the party holds the range or only uses it, where a source said so.
+	Tenure Tenure `json:"tenure,omitzero"`
 
 	Inferences []*inference.Inference `json:"inferences,omitzero"`
 }
@@ -105,12 +198,27 @@ type registry struct {
 	rdap *rdap.Client
 }
 
+// DefaultMaxAutNums bounds how many of a party's networks are followed to their prefixes.
+//
+// Each one is several requests, and a party running more than a handful of networks is one whose
+// prefixes the first few already describe.
+const DefaultMaxAutNums = 10
+
 // Finder holds the sources a run uses.
 type Finder struct {
 	ripe       *ripe.Client
 	arin       *arin.Client
+	ripestat   *ripestat.Client
 	registries []*registry
 	config     *finder_config.Config
+}
+
+func (finder *Finder) maxAutNums() int {
+	if maxAutNums := finder.config.MaxAutNums; maxAutNums > 0 {
+		return maxAutNums
+	}
+
+	return DefaultMaxAutNums
 }
 
 // NewFinder builds a finder. A source the caller did not provide is built with its own defaults, so
@@ -128,9 +236,15 @@ func NewFinder(options ...finder_config.Option) *Finder {
 		arinClient = arin.NewClient()
 	}
 
+	ripestatClient := config.Ripestat
+	if ripestatClient == nil {
+		ripestatClient = ripestat.NewClient()
+	}
+
 	return &Finder{
 		ripe:       ripeClient,
 		arin:       arinClient,
+		ripestat:   ripestatClient,
 		registries: registries(config),
 		config:     config,
 	}
@@ -189,6 +303,20 @@ func pair(whoisClients map[inference.Method]*whois.Client, rdapClients map[infer
 	}
 
 	return built
+}
+
+// reverseResolver is what the reverse-delegation walk asks. It needs more of a resolver than the SPF
+// walk does, so a caller's SPF resolver is used only where it answers these too.
+func (finder *Finder) reverseResolver() reverse.Resolver {
+	if resolver := finder.config.ReverseResolver; resolver != nil {
+		return resolver
+	}
+
+	if resolver, ok := finder.config.Resolver.(reverse.Resolver); ok && resolver != nil {
+		return resolver
+	}
+
+	return net.DefaultResolver
 }
 
 func (finder *Finder) resolver() spf.Resolver {
@@ -254,6 +382,16 @@ func (finder *Finder) Find(ctx context.Context, domain string) ([]*Range, error)
 			}
 		}
 
+		// Held wins over used, and both over nothing said. A range one registry only assigned to the
+		// party and another registered to it is the party's: the stronger claim is the true one, and
+		// a party is not made a tenant by a second source knowing less.
+		if tenure := TenureFromStatus(existing.Status); tenure != TenureUnknown {
+			existing.Tenure = tenure
+		}
+		if existing.Tenure != TenureHeld && details != nil && details.Tenure != TenureUnknown {
+			existing.Tenure = details.Tenure
+		}
+
 		existing.Inferences = inference.Merge(append(existing.Inferences, inferences...))
 	}
 
@@ -268,13 +406,26 @@ func (finder *Finder) Find(ctx context.Context, domain string) ([]*Range, error)
 	// The sources that search by domain go first, and not only because they are the good ones. The
 	// registries after them cannot search by domain at all and have to be given a name, and the
 	// organisations these two attribute are where the best of those names come from.
+	//
+	// The networks are gathered the same way and for the same reason: they are what the last round
+	// follows to the prefixes a party routes, and every one of them was registered to a party this
+	// round had already checked against the domain.
 	var (
-		organizations     []string
-		organizationsLock sync.Mutex
+		organizations []string
+		autNums       []string
+		gatheredLock  sync.Mutex
 	)
 
+	gathered := func(names []string, numbers []string) {
+		gatheredLock.Lock()
+		defer gatheredLock.Unlock()
+
+		organizations = append(organizations, names...)
+		autNums = append(autNums, numbers...)
+	}
+
 	waitGroup.Go(func() {
-		ranges, err := finder.ripeRanges(ctx, domain)
+		ranges, numbers, err := finder.ripeRanges(ctx, domain)
 		if err != nil {
 			report(err, "ripe")
 
@@ -284,10 +435,12 @@ func (finder *Finder) Find(ctx context.Context, domain string) ([]*Range, error)
 		for _, item := range ranges {
 			add(item.Network, item, item.Inferences...)
 		}
+
+		gathered(nil, numbers)
 	})
 
 	waitGroup.Go(func() {
-		ranges, names, err := finder.arinRanges(ctx, domain)
+		ranges, names, numbers, err := finder.arinRanges(ctx, domain)
 		if err != nil {
 			report(err, "arin")
 
@@ -298,10 +451,29 @@ func (finder *Finder) Find(ctx context.Context, domain string) ([]*Range, error)
 			add(item.Network, item, item.Inferences...)
 		}
 
-		organizationsLock.Lock()
-		defer organizationsLock.Unlock()
+		gathered(names, numbers)
+	})
 
-		organizations = append(organizations, names...)
+	waitGroup.Go(func() {
+		// A registry hands a reverse zone to the holder of the space and to nobody else, so a
+		// delegation pointing into the domain is the registry and the party agreeing about who
+		// holds it -- said in the DNS rather than in a database.
+		ranges, err := reverse.Networks(ctx, domain, nil, finder.reverseResolver())
+		if err != nil {
+			slog.ErrorContext(
+				altshiftContext.WithError(ctx, altshiftErrors.New(fmt.Errorf("reverse networks: %w", err), domain)),
+				"An error occurred when reading the reverse delegations.",
+			)
+
+			return
+		}
+
+		for _, item := range ranges {
+			if item == nil {
+				continue
+			}
+			add(item.Network, nil, item.Inferences...)
+		}
 	})
 
 	waitGroup.Go(func() {
@@ -332,7 +504,7 @@ func (finder *Finder) Find(ctx context.Context, domain string) ([]*Range, error)
 
 	for _, source := range finder.registries {
 		waitGroup.Go(func() {
-			ranges, err := finder.registryRanges(ctx, source, domain, names)
+			ranges, numbers, err := finder.registryRanges(ctx, source, domain, names)
 			// The ranges come back alongside the failure rather than instead of it, one route into a
 			// registry being able to fail while the other answers.
 			if err != nil {
@@ -342,26 +514,44 @@ func (finder *Finder) Find(ctx context.Context, domain string) ([]*Range, error)
 			for _, item := range ranges {
 				add(item.Network, item, item.Inferences...)
 			}
+
+			gathered(nil, numbers)
 		})
 	}
 
 	waitGroup.Wait()
 
+	// Last, the other axis: what the party's own networks authorise and announce. It runs at the end
+	// because a network is something the rounds before it found, and every one of them came off a
+	// contact or an organisation already checked against the domain -- so the prefixes rest on the
+	// same evidence the allocations do, and no further check is owed.
+	slices.Sort(autNums)
+
+	ranges, err := finder.networkRanges(ctx, slices.Compact(autNums))
+	if err != nil {
+		report(err, "routing")
+	}
+
+	for _, item := range ranges {
+		add(item.Network, item, item.Inferences...)
+	}
+
 	return Collapse(slices.Collect(maps.Values(byNetwork))), nil
 }
 
 // ripeRanges asks the registry what the domain's contacts administer.
-func (finder *Finder) ripeRanges(ctx context.Context, domain string) ([]*Range, error) {
+func (finder *Finder) ripeRanges(ctx context.Context, domain string) ([]*Range, []string, error) {
 	registrants, err := finder.ripe.Registrants(ctx, domain, finder.config.FetchOptions...)
 	if err != nil {
-		return nil, fmt.Errorf("registrants: %w", err)
+		return nil, nil, fmt.Errorf("registrants: %w", err)
 	}
 
 	if registrants == nil {
-		return []*Range{}, nil
+		return []*Range{}, nil, nil
 	}
 
 	found := make([]*Range, 0)
+	numbers := make([]string, 0)
 
 	// The contacts a range names, and the organisations it belongs to. Both, because they are
 	// different claims: a contact is who to write to about the space, an organisation is whose it
@@ -376,9 +566,37 @@ func (finder *Finder) ripeRanges(ctx context.Context, domain string) ([]*Range, 
 
 	for _, walk := range walks {
 		for _, handle := range walk.handles {
+			// The networks registered to the same handle. They lead to prefixes the allocations do
+			// not cover, and asking costs one request on a handle already being asked about.
+			autNums, err := finder.ripe.AutNums(ctx, handle, finder.config.FetchOptions...)
+			if err != nil {
+				return nil, nil, altshiftErrors.New(fmt.Errorf("aut nums: %w", err), handle)
+			}
+			numbers = append(numbers, autNums...)
+
+			// The reverse zones delegated to the same handle. A registry hands one only to the
+			// holder of the space, and the delegation is arranged per block rather than per
+			// allocation -- so this finds blocks the allocations do not name.
+			zones, err := finder.ripe.ReverseZones(ctx, handle, finder.config.FetchOptions...)
+			if err != nil {
+				return nil, nil, altshiftErrors.New(fmt.Errorf("reverse zones: %w", err), handle)
+			}
+
+			for _, network := range zones {
+				found = append(
+					found,
+					&Range{
+						Network: network,
+						Inferences: []*inference.Inference{
+							inference.New(reverse.Method, reverse.Confidence, handle, ripe.Domain),
+						},
+					},
+				)
+			}
+
 			ranges, err := walk.ranges(ctx, handle, finder.config.FetchOptions...)
 			if err != nil {
-				return nil, altshiftErrors.New(fmt.Errorf("ranges: %w", err), handle)
+				return nil, nil, altshiftErrors.New(fmt.Errorf("ranges: %w", err), handle)
 			}
 
 			for _, item := range ranges {
@@ -404,7 +622,7 @@ func (finder *Finder) ripeRanges(ctx context.Context, domain string) ([]*Range, 
 		}
 	}
 
-	return found, nil
+	return found, numbers, nil
 }
 
 func nicHandles(persons []*ripe.Person) []string {
@@ -438,14 +656,18 @@ func organizationHandles(organizations []*ripe.Organization) []string {
 // It also answers with the names of the organisations it attributed, which are the terms given to
 // the registries that cannot search by domain at all. A name ARIN checked against the domain's own
 // contacts is a far better term than a guess, and it is free here.
-func (finder *Finder) arinRanges(ctx context.Context, domain string) ([]*Range, []string, error) {
+func (finder *Finder) arinRanges(
+	ctx context.Context,
+	domain string,
+) ([]*Range, []string, []string, error) {
 	ranges, err := finder.arin.Ranges(ctx, domain, finder.config.FetchOptions...)
 	if err != nil {
-		return nil, nil, fmt.Errorf("ranges: %w", err)
+		return nil, nil, nil, fmt.Errorf("ranges: %w", err)
 	}
 
 	found := make([]*Range, 0, len(ranges))
 	organizations := make([]string, 0)
+	handles := make([]string, 0)
 
 	for _, item := range ranges {
 		if item == nil {
@@ -454,6 +676,9 @@ func (finder *Finder) arinRanges(ctx context.Context, domain string) ([]*Range, 
 
 		if item.Organization != nil && item.Organization.Name != "" {
 			organizations = append(organizations, item.Organization.Name)
+		}
+		if item.Organization != nil && item.Organization.Handle != "" {
+			handles = append(handles, item.Organization.Handle)
 		}
 
 		// The organisation the space was attributed through and the allocation as the registry
@@ -483,7 +708,22 @@ func (finder *Finder) arinRanges(ctx context.Context, domain string) ([]*Range, 
 		}
 	}
 
-	return found, organizations, nil
+	// The networks registered to the organisations the ranges were attributed through. The
+	// organisation is already checked against the domain's contacts, so its networks are the
+	// party's on the same evidence its allocations are.
+	slices.Sort(handles)
+	numbers := make([]string, 0)
+
+	for _, handle := range slices.Compact(handles) {
+		autNums, err := finder.arin.OrganizationAutNums(ctx, handle, finder.config.FetchOptions...)
+		if err != nil {
+			return nil, nil, nil, altshiftErrors.New(fmt.Errorf("organization aut nums: %w", err), handle)
+		}
+
+		numbers = append(numbers, autNums...)
+	}
+
+	return found, organizations, numbers, nil
 }
 
 // registryRanges asks a database that offers no search from a domain, both ways it can be asked.
@@ -497,18 +737,56 @@ func (finder *Finder) registryRanges(
 	source *registry,
 	domain string,
 	names []string,
-) ([]*Range, error) {
+) ([]*Range, []string, error) {
 	if source == nil {
-		return nil, altshiftErrors.NewWithTrace(nil_error.New("registry"))
+		return nil, nil, altshiftErrors.NewWithTrace(nil_error.New("registry"))
 	}
 
 	found := make([]*Range, 0)
+	numbers := make([]string, 0)
 	problems := make([]error, 0, 2)
 
 	if source.whois != nil {
 		ranges, err := source.whois.Ranges(ctx, domain)
 		if err != nil {
 			problems = append(problems, fmt.Errorf("whois ranges: %w", err))
+		}
+
+		// The networks registered to the same contacts the ranges were reached through.
+		contacts := make([]string, 0, len(ranges))
+		for _, item := range ranges {
+			if item != nil && item.Contact != "" {
+				contacts = append(contacts, item.Contact)
+			}
+		}
+		slices.Sort(contacts)
+
+		for _, contact := range slices.Compact(contacts) {
+			autNums, err := source.whois.AutNums(ctx, contact)
+			if err != nil {
+				problems = append(problems, altshiftErrors.New(fmt.Errorf("aut nums: %w", err), contact))
+			} else {
+				numbers = append(numbers, autNums...)
+			}
+
+			zones, err := source.whois.ReverseZones(ctx, contact)
+			if err != nil {
+				problems = append(problems, altshiftErrors.New(fmt.Errorf("reverse zones: %w", err), contact))
+
+				continue
+			}
+
+			for _, network := range zones {
+				found = append(
+					found,
+					&Range{
+						Network: network,
+						Inferences: []*inference.Inference{
+							inference.New(reverse.Method, reverse.Confidence, contact, source.whois.Host()),
+						},
+					},
+				)
+			}
 		}
 
 		for _, item := range ranges {
@@ -553,6 +831,9 @@ func (finder *Finder) registryRanges(
 			handle := ""
 			if item.Entity != nil {
 				handle = item.Entity.Handle
+				// The server answers with the party's networks alongside its allocations, so these
+				// cost nothing at all.
+				numbers = append(numbers, item.Entity.AutNums...)
 			}
 
 			for _, network := range item.Networks {
@@ -573,6 +854,110 @@ func (finder *Finder) registryRanges(
 
 	// What one route found is kept whatever the other did, so the ranges come back alongside the
 	// failure rather than instead of it.
+	if len(problems) != 0 {
+		return found, numbers, errors.Join(problems...)
+	}
+
+	return found, numbers, nil
+}
+
+// networkRanges asks what a party's own networks authorise and announce.
+//
+// It is the second axis, and the reason for it is that an allocation and a prefix are different
+// things: an allocation is what a party was given, a prefix is what its network routes, and a party
+// routing space under someone else's allocation holds no record of it anywhere a registry search
+// would look. The routing data is also global, so this is what reaches the region no registry
+// search here does.
+//
+// The three answers are kept apart because they are worth different things. A signed authorisation
+// and a route object are statements about whose the addresses are; an announcement is an
+// observation of what is being routed, which a transit provider's network makes about its
+// customers' space as readily as about its own.
+func (finder *Finder) networkRanges(ctx context.Context, numbers []string) ([]*Range, error) {
+	found := make([]*Range, 0)
+	problems := make([]error, 0)
+
+	add := func(network string, method inference.Method, confidence inference.Confidence, via ...string) {
+		found = append(
+			found,
+			&Range{
+				Network:    network,
+				Inferences: []*inference.Inference{inference.New(method, confidence, via...)},
+			},
+		)
+	}
+
+	for index, number := range numbers {
+		if index >= finder.maxAutNums() {
+			break
+		}
+
+		if finder.ripestat != nil {
+			roas, err := finder.ripestat.Roas(ctx, number, finder.config.FetchOptions...)
+			if err != nil {
+				problems = append(problems, altshiftErrors.New(fmt.Errorf("roas: %w", err), number))
+			}
+
+			for _, item := range roas {
+				if item != nil && item.Prefix != "" {
+					add(item.Prefix, MethodRpki, RpkiConfidence, number, item.TrustAnchor)
+				}
+			}
+
+			announced, err := finder.ripestat.AnnouncedPrefixes(ctx, number, finder.config.FetchOptions...)
+			if err != nil {
+				problems = append(
+					problems,
+					altshiftErrors.New(fmt.Errorf("announced prefixes: %w", err), number),
+				)
+			}
+
+			for _, prefix := range announced {
+				add(prefix, MethodBgp, BgpConfidence, number)
+			}
+		}
+
+		// The route objects live in the registries' own databases, so every database is asked: a
+		// party's prefix is declared in whichever of them holds the address space, which is not
+		// necessarily the one its network is registered in.
+		for _, source := range finder.registries {
+			if source == nil || source.whois == nil {
+				continue
+			}
+
+			prefixes, err := source.whois.RoutePrefixes(ctx, number)
+			if err != nil {
+				problems = append(
+					problems,
+					altshiftErrors.New(fmt.Errorf("route prefixes: %w", err), number, source.whois.Host()),
+				)
+
+				continue
+			}
+
+			for _, prefix := range prefixes {
+				add(prefix, MethodRouteObject, RouteObjectConfidence, number, source.whois.Host())
+			}
+		}
+
+		if finder.ripe != nil {
+			prefixes, err := finder.ripe.RoutePrefixes(ctx, number, finder.config.FetchOptions...)
+			if err != nil {
+				problems = append(
+					problems,
+					altshiftErrors.New(fmt.Errorf("route prefixes: %w", err), number),
+				)
+
+				continue
+			}
+
+			for _, prefix := range prefixes {
+				add(prefix, MethodRouteObject, RouteObjectConfidence, number, ripe.Domain)
+			}
+		}
+	}
+
+	// What one answer found is kept whatever the others did.
 	if len(problems) != 0 {
 		return found, errors.Join(problems...)
 	}
@@ -627,6 +1012,12 @@ func Collapse(ranges []*Range) []*Range {
 			ranges[otherIndex].Inferences = inference.Merge(
 				append(ranges[otherIndex].Inferences, item.Inferences...),
 			)
+
+			// A range held inside one only used is still held: the containing range is the extent of
+			// what the party was given, and the narrower claim cannot weaken it.
+			if item.Tenure == TenureHeld || ranges[otherIndex].Tenure == TenureUnknown {
+				ranges[otherIndex].Tenure = item.Tenure
+			}
 
 			break
 		}

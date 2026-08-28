@@ -535,3 +535,41 @@ func TestArgumentChecks(t *testing.T) {
 		t.Error("expected an empty domain to be an error")
 	}
 }
+
+// TestOrganizationAutNums holds the same link as the allocations, followed to a different resource:
+// a number leads to prefixes the allocations do not cover.
+func TestOrganizationAutNums(t *testing.T) {
+	t.Parallel()
+
+	client := serverClient(t, func(writer http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.EscapedPath(), "/asns") {
+			writer.WriteHeader(http.StatusNotFound)
+
+			return
+		}
+
+		writer.Header().Set("Content-Type", "application/json")
+		body := `{"asns":{"asnRef":[{"@handle":"AS13335","@name":"CLOUDFLARENET"},
+			{"@handle":"AS14789","@name":"CLOUDFLARENET"}]}}`
+		if _, err := fmt.Fprint(writer, body); err != nil {
+			t.Errorf("could not write: %v", err)
+		}
+	})
+
+	numbers, err := client.OrganizationAutNums(t.Context(), "CLOUD14")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !slices.Equal(numbers, []string{"AS13335", "AS14789"}) {
+		t.Errorf("expected the numbers, got %v", numbers)
+	}
+
+	// An organisation holding no networks is answered with a 404, which is an answer.
+	empty := serverClient(t, func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusNotFound)
+	})
+	if got, err := empty.OrganizationAutNums(t.Context(), "EX-1"); err != nil || len(got) != 0 {
+		t.Errorf("expected nothing and no error, got %v and %v", got, err)
+	}
+}

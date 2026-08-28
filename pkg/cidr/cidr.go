@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"strconv"
 	"strings"
 
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
@@ -127,6 +128,198 @@ func Prefixes(text string) ([]string, error) {
 	}
 
 	return nil, altshiftErrors.NewWithTrace(ErrMalformedRange, text)
+}
+
+// The suffixes reverse DNS is served under, and the label widths each of them counts in.
+const (
+	Ipv4ReverseSuffix = "in-addr.arpa"
+	Ipv6ReverseSuffix = "ip6.arpa"
+)
+
+// The prefix lengths a reverse zone is delegated at.
+//
+// A zone name has one label per octet for v4 and one per nibble for v6, so only these lengths can
+// be written as a zone at all. They are listed longest first because a walk looking for the
+// delegation wants the most specific zone first: the delegation sits at whatever boundary the
+// holder took, which is a /24 for one party and a /16 for the next.
+var (
+	Ipv4ReverseLengths = []int{32, 24, 16, 8}
+	// The v6 list stops short of every nibble boundary on purpose. There are thirty-two of them and
+	// each is a query; these are the lengths address space is actually handed out and delegated at.
+	Ipv6ReverseLengths = []int{64, 56, 48, 40, 32, 24, 16}
+)
+
+// FromReverseZone reads the prefix a reverse zone is the zone for.
+//
+// The name is the address written backwards under a suffix -- 8.8.8.in-addr.arpa is 8.8.8.0/24 --
+// so the labels count the prefix's length as well as naming it, and a zone is exactly as specific
+// as the delegation that created it.
+func FromReverseZone(zone string) (string, error) {
+	zone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zone), "."))
+
+	if labels, found := strings.CutSuffix(zone, "."+Ipv4ReverseSuffix); found {
+		prefix, err := ipv4ReverseZone(labels)
+		if err != nil {
+			return "", altshiftErrors.New(fmt.Errorf("ipv4 reverse zone: %w", err), zone)
+		}
+
+		return prefix, nil
+	}
+
+	if labels, found := strings.CutSuffix(zone, "."+Ipv6ReverseSuffix); found {
+		prefix, err := ipv6ReverseZone(labels)
+		if err != nil {
+			return "", altshiftErrors.New(fmt.Errorf("ipv6 reverse zone: %w", err), zone)
+		}
+
+		return prefix, nil
+	}
+
+	return "", altshiftErrors.NewWithTrace(ErrMalformedRange, zone)
+}
+
+// ipv4ReverseZone reads the labels of an in-addr.arpa zone, which are the octets written backwards.
+func ipv4ReverseZone(labels string) (string, error) {
+	parts := strings.Split(labels, ".")
+	if len(parts) == 0 || len(parts) > 4 {
+		return "", altshiftErrors.NewWithTrace(ErrMalformedRange, labels)
+	}
+
+	octets := make([]string, 4)
+	for index := range octets {
+		octets[index] = "0"
+	}
+
+	for index, part := range parts {
+		// A classless delegation writes a range of addresses as one label -- "0-25" -- which names
+		// no prefix of its own, so it is not one of these.
+		value, err := strconv.Atoi(part)
+		if err != nil || value < 0 || value > 255 {
+			return "", altshiftErrors.NewWithTrace(ErrMalformedRange, labels)
+		}
+
+		octets[len(parts)-1-index] = part
+	}
+
+	prefix, err := netip.ParsePrefix(strings.Join(octets, ".") + "/" + strconv.Itoa(8*len(parts)))
+	if err != nil {
+		return "", altshiftErrors.NewWithTrace(fmt.Errorf("parse prefix: %w", err), labels)
+	}
+
+	return prefix.Masked().String(), nil
+}
+
+// ipv6ReverseZone reads the labels of an ip6.arpa zone, which are the nibbles written backwards.
+func ipv6ReverseZone(labels string) (string, error) {
+	parts := strings.Split(labels, ".")
+	if len(parts) == 0 || len(parts) > 32 {
+		return "", altshiftErrors.NewWithTrace(ErrMalformedRange, labels)
+	}
+
+	nibbles := make([]byte, 32)
+	for index := range nibbles {
+		nibbles[index] = '0'
+	}
+
+	for index, part := range parts {
+		if len(part) != 1 {
+			return "", altshiftErrors.NewWithTrace(ErrMalformedRange, labels)
+		}
+
+		digit := part[0]
+		isDigit := digit >= '0' && digit <= '9'
+		isHex := digit >= 'a' && digit <= 'f'
+		if !isDigit && !isHex {
+			return "", altshiftErrors.NewWithTrace(ErrMalformedRange, labels)
+		}
+
+		nibbles[len(parts)-1-index] = digit
+	}
+
+	// Grouped into hextets, an address being written four nibbles at a time.
+	hextets := make([]string, 0, 8)
+	for index := 0; index < len(nibbles); index += 4 {
+		hextets = append(hextets, string(nibbles[index:index+4]))
+	}
+
+	prefix, err := netip.ParsePrefix(
+		strings.Join(hextets, ":") + "/" + strconv.Itoa(4*len(parts)),
+	)
+	if err != nil {
+		return "", altshiftErrors.NewWithTrace(fmt.Errorf("parse prefix: %w", err), labels)
+	}
+
+	return prefix.Masked().String(), nil
+}
+
+// ReverseZones names the zones an address could have its reverse delegated at, most specific first.
+//
+// The delegation sits at whatever boundary the holder took, and nothing in the address says which,
+// so finding it means asking for each in turn until one answers.
+func ReverseZones(address netip.Addr) []string {
+	address = address.Unmap().WithZone("")
+	if !address.IsValid() {
+		return nil
+	}
+
+	lengths := Ipv6ReverseLengths
+	if address.Is4() {
+		lengths = Ipv4ReverseLengths
+	}
+
+	zones := make([]string, 0, len(lengths))
+	for _, length := range lengths {
+		zone, err := ReverseZone(netip.PrefixFrom(address, length))
+		if err != nil {
+			continue
+		}
+
+		zones = append(zones, zone)
+	}
+
+	return zones
+}
+
+// ReverseZone names the zone a prefix's reverse is delegated at.
+//
+// Only a prefix falling on a label boundary has one -- an octet for v4, a nibble for v6 -- because
+// a zone name is written a label at a time and can say nothing finer.
+func ReverseZone(prefix netip.Prefix) (string, error) {
+	address := prefix.Masked().Addr()
+	if !address.IsValid() {
+		return "", altshiftErrors.NewWithTrace(ErrMalformedRange, prefix.String())
+	}
+
+	if address.Is4() {
+		if prefix.Bits()%8 != 0 || prefix.Bits() == 0 {
+			return "", altshiftErrors.NewWithTrace(ErrMalformedRange, prefix.String())
+		}
+
+		octets := address.As4()
+		labels := make([]string, 0, 4)
+		for index := prefix.Bits()/8 - 1; index >= 0; index-- {
+			labels = append(labels, strconv.Itoa(int(octets[index])))
+		}
+
+		return strings.Join(labels, ".") + "." + Ipv4ReverseSuffix, nil
+	}
+
+	if prefix.Bits()%4 != 0 || prefix.Bits() == 0 {
+		return "", altshiftErrors.NewWithTrace(ErrMalformedRange, prefix.String())
+	}
+
+	octets := address.As16()
+	labels := make([]string, 0, 32)
+	for index := prefix.Bits()/4 - 1; index >= 0; index-- {
+		nibble := octets[index/2] >> 4
+		if index%2 == 1 {
+			nibble = octets[index/2] & 0x0f
+		}
+
+		labels = append(labels, strconv.FormatUint(uint64(nibble), 16))
+	}
+
+	return strings.Join(labels, ".") + "." + Ipv6ReverseSuffix, nil
 }
 
 // Strings renders prefixes as text.

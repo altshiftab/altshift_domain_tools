@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/altshiftab/altshift_domain_tools/pkg/asn"
 	"github.com/altshiftab/altshift_domain_tools/pkg/cidr"
 	"github.com/altshiftab/altshift_domain_tools/pkg/email"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripe/ripe_config"
@@ -83,6 +84,16 @@ var (
 	PersonInverseAttributes = []string{"admin-c", "tech-c", "abuse-c"}
 	// OrganizationInverseAttributes are the ways a range points at an organisation.
 	OrganizationInverseAttributes = []string{"org"}
+)
+
+// The other object types read here: the one a network is, and the two a declared origin is.
+const (
+	TypeAutNum = "aut-num"
+	TypeRoute  = "route"
+	TypeRoute6 = "route6"
+	// TypeDomain is a delegation, which for a reverse zone is the registry recording who the space
+	// it names was handed to.
+	TypeDomain = "domain"
 )
 
 // TypeFilters are the object types a range is written as. Both, because a filter naming only
@@ -445,6 +456,205 @@ func (client *Client) OrganizationRanges(
 	}
 
 	return ranges, nil
+}
+
+// AutNums returns the autonomous system numbers registered to the contact or the organisation.
+//
+// It is the same inverse search the allocations use, asked for a different kind of object. What the
+// number is worth is that it leads somewhere the registry does not: to the prefixes the network
+// authorises and announces, which are not the same set as the allocations.
+func (client *Client) AutNums(
+	ctx context.Context,
+	handle string,
+	options ...fetch_config.Option,
+) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("context err: %w", err)
+	}
+
+	if client == nil {
+		return nil, altshiftErrors.NewWithTrace(nil_error.New("client"))
+	}
+
+	if handle == "" {
+		return nil, altshiftErrors.NewWithTrace(empty_error.New("handle"))
+	}
+
+	// The organisation as well as the contacts, an aut-num naming both.
+	attributes := slices.Concat(PersonInverseAttributes, OrganizationInverseAttributes)
+
+	objects, err := client.inverse(ctx, handle, attributes, []string{TypeAutNum}, options)
+	if err != nil {
+		return nil, altshiftErrors.New(fmt.Errorf("inverse: %w", err), handle)
+	}
+
+	numbers := make([]string, 0, len(objects))
+
+	for _, object := range objects {
+		if number := asn.Normalize(object["aut-num"]); number != "" {
+			numbers = append(numbers, number)
+		}
+	}
+
+	slices.Sort(numbers)
+
+	return slices.Compact(numbers), nil
+}
+
+// RoutePrefixes returns the prefixes declared as originating from the network.
+//
+// A route object is the maintainer of the address space authorising a network to announce it, which
+// makes it a claim about whose the addresses are rather than an observation of what is routed.
+func (client *Client) RoutePrefixes(
+	ctx context.Context,
+	number string,
+	options ...fetch_config.Option,
+) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("context err: %w", err)
+	}
+
+	if client == nil {
+		return nil, altshiftErrors.NewWithTrace(nil_error.New("client"))
+	}
+
+	normalized := asn.Normalize(number)
+	if normalized == "" {
+		return nil, altshiftErrors.NewWithTrace(empty_error.New("number"))
+	}
+
+	objects, err := client.inverse(
+		ctx,
+		normalized,
+		[]string{"origin"},
+		[]string{TypeRoute, TypeRoute6},
+		options,
+	)
+	if err != nil {
+		return nil, altshiftErrors.New(fmt.Errorf("inverse: %w", err), normalized)
+	}
+
+	prefixes := make([]string, 0, len(objects))
+
+	for _, object := range objects {
+		// The object is about a prefix, and only ever a prefix -- unlike an allocation, which is
+		// written as two addresses.
+		written := object[TypeRoute]
+		if written == "" {
+			written = object[TypeRoute6]
+		}
+
+		networks, err := cidr.Prefixes(written)
+		if err != nil {
+			continue
+		}
+
+		prefixes = append(prefixes, networks...)
+	}
+
+	slices.Sort(prefixes)
+
+	return slices.Compact(prefixes), nil
+}
+
+// ReverseZones returns the prefixes whose reverse DNS is delegated to the contact or organisation.
+//
+// A registry delegates a reverse zone only to the holder of the address space, and records the
+// delegation as an object of its own -- so an object naming the party is the registry stating that
+// the party holds the block the zone is the zone for. The zone name carries the prefix: a zone has
+// one label per octet, so 8.8.8.in-addr.arpa is 8.8.8.0/24 and nothing else.
+func (client *Client) ReverseZones(
+	ctx context.Context,
+	handle string,
+	options ...fetch_config.Option,
+) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("context err: %w", err)
+	}
+
+	if client == nil {
+		return nil, altshiftErrors.NewWithTrace(nil_error.New("client"))
+	}
+
+	if handle == "" {
+		return nil, altshiftErrors.NewWithTrace(empty_error.New("handle"))
+	}
+
+	attributes := slices.Concat(PersonInverseAttributes, OrganizationInverseAttributes)
+
+	objects, err := client.inverse(ctx, handle, attributes, []string{TypeDomain}, options)
+	if err != nil {
+		return nil, altshiftErrors.New(fmt.Errorf("inverse: %w", err), handle)
+	}
+
+	prefixes := make([]string, 0, len(objects))
+
+	for _, object := range objects {
+		// A forward zone is an object of the same type and names no prefix; a classless delegation
+		// names a range of addresses rather than a block. Both fail to read and are dropped.
+		prefix, err := cidr.FromReverseZone(object[TypeDomain])
+		if err != nil {
+			continue
+		}
+
+		prefixes = append(prefixes, prefix)
+	}
+
+	slices.Sort(prefixes)
+
+	return slices.Compact(prefixes), nil
+}
+
+// inverse returns the attributes of the objects referencing the handle.
+func (client *Client) inverse(
+	ctx context.Context,
+	handle string,
+	attributes []string,
+	types []string,
+	options []fetch_config.Option,
+) ([]map[string]string, error) {
+	requestUrl := *client.baseUrl
+	requestUrl.Path += SearchPath
+	requestUrl.RawQuery = url.Values{
+		"query-string":      []string{handle},
+		"inverse-attribute": attributes,
+		"type-filter":       types,
+		"flags":             []string{"no-referenced"},
+	}.Encode()
+
+	requestUrlString := requestUrl.String()
+
+	_, response, err := altshiftHttpUtils.FetchJson[*searchResponse](
+		ctx,
+		requestUrlString,
+		client.fetchOptions(options)...,
+	)
+	if err != nil {
+		// A handle with nothing behind it is answered with a 404 rather than an empty result, which
+		// is an answer rather than a failure.
+		if statusError, ok := errors.AsType[*altshiftHttpErrors.Non2xxStatusCodeError](err); ok &&
+			statusError != nil && statusError.StatusCode == http.StatusNotFound {
+			return []map[string]string{}, nil
+		}
+
+		return nil, altshiftErrors.New(fmt.Errorf("fetch json: %w", err), requestUrlString)
+	}
+
+	if response == nil || response.Objects == nil {
+		return []map[string]string{}, nil
+	}
+
+	found := make([]map[string]string, 0, len(response.Objects.Object))
+
+	for _, object := range response.Objects.Object {
+		if object == nil || object.Attributes == nil {
+			continue
+		}
+
+		found = append(found, values(object.Attributes.Attribute))
+	}
+
+	return found, nil
 }
 
 // inverseRanges returns the allocations referencing the handle in one of the attributes.

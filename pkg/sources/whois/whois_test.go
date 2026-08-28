@@ -533,3 +533,116 @@ func TestQueryStopsWithTheContext(t *testing.T) {
 		t.Error("expected a cancelled context to end the query")
 	}
 }
+
+// TestReverseZones holds the registry's own record of a delegation. A registry hands a reverse zone
+// to the holder of the address space and to nobody else, and the zone name carries the prefix.
+func TestReverseZones(t *testing.T) {
+	t.Parallel()
+
+	client, fake := serverClient(t, func(query string) string {
+		if !strings.Contains(query, "-T domain") {
+			return "%ERROR:101: no entries found\n"
+		}
+
+		return `domain:    8.8.8.in-addr.arpa
+nserver:   ns1.example.com
+mnt-by:    EXAMPLE-MNT
+
+domain:    10.193.in-addr.arpa
+nserver:   ns1.example.com
+
+domain:    0.0.a.d.0.0.a.2.ip6.arpa
+nserver:   ns1.example.com
+
+domain:    example.com
+nserver:   ns1.example.com
+`
+	})
+
+	prefixes, err := client.ReverseZones(t.Context(), "EX1-EXAMPLE")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// A forward zone is an object of the same type and names no prefix, so it is dropped rather
+	// than turned into one.
+	if !slices.Equal(prefixes, []string{"193.10.0.0/16", "2a00:da00::/32", "8.8.8.0/24"}) {
+		t.Errorf("expected the delegated blocks, got %v", prefixes)
+	}
+
+	if queries := fake.queries(); len(queries) == 0 || !strings.Contains(queries[0], "-T domain") {
+		t.Errorf("expected the delegations asked for, got %v", queries)
+	}
+}
+
+// TestAutNums holds the other kind of object the same inverse search reaches, and why: a number
+// leads to the prefixes a network authorises and announces, which the allocations do not cover.
+func TestAutNums(t *testing.T) {
+	t.Parallel()
+
+	client, _ := serverClient(t, func(query string) string {
+		if !strings.Contains(query, "-T aut-num") {
+			return "%ERROR:101: no entries found\n"
+		}
+
+		return "aut-num: AS64500\nas-name: EXAMPLE\n\naut-num: as0064501\nas-name: EXAMPLE2\n"
+	})
+
+	numbers, err := client.AutNums(t.Context(), "EX1-EXAMPLE")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Written the one way, whatever the object spelled it.
+	if !slices.Equal(numbers, []string{"AS64500", "AS64501"}) {
+		t.Errorf("expected the numbers normalised, got %v", numbers)
+	}
+}
+
+// TestRoutePrefixes holds the registry's version of an origin authorisation: the maintainer of the
+// address space authorising a network to announce it.
+func TestRoutePrefixes(t *testing.T) {
+	t.Parallel()
+
+	client, _ := serverClient(t, func(query string) string {
+		if !strings.Contains(query, "-T route") {
+			return "%ERROR:101: no entries found\n"
+		}
+
+		return `route:   192.0.2.0/24
+origin:  AS64500
+
+route6:  2001:db8::/32
+origin:  AS64500
+`
+	})
+
+	prefixes, err := client.RoutePrefixes(t.Context(), "64500")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !slices.Equal(prefixes, []string{"192.0.2.0/24", "2001:db8::/32"}) {
+		t.Errorf("expected both families, got %v", prefixes)
+	}
+}
+
+// TestRefusedAttributeIsAnAnswer holds that a database refusing to search an attribute has said the
+// walk cannot go this way here, which is not the run breaking.
+func TestRefusedAttributeIsAnAnswer(t *testing.T) {
+	t.Parallel()
+
+	client, _ := serverClient(t, func(string) string {
+		return "%ERROR:105: attribute is not searchable\n"
+	})
+
+	if got, err := client.AutNums(t.Context(), "EX1"); err != nil || len(got) != 0 {
+		t.Errorf("expected nothing and no error, got %v and %v", got, err)
+	}
+	if got, err := client.ReverseZones(t.Context(), "EX1"); err != nil || len(got) != 0 {
+		t.Errorf("expected nothing and no error, got %v and %v", got, err)
+	}
+	if got, err := client.RoutePrefixes(t.Context(), "AS64500"); err != nil || len(got) != 0 {
+		t.Errorf("expected nothing and no error, got %v and %v", got, err)
+	}
+}

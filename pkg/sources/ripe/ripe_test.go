@@ -425,3 +425,92 @@ func TestArgumentChecks(t *testing.T) {
 		t.Error("expected an empty nic handle to be an error")
 	}
 }
+
+// TestReverseZonesRipe holds the registry's own record of a delegation, which it hands only to the
+// holder of the address space. The zone name carries the prefix.
+func TestReverseZonesRipe(t *testing.T) {
+	t.Parallel()
+
+	var asked url.Values
+
+	client := serverClient(t, func(writer http.ResponseWriter, request *http.Request) {
+		asked = request.URL.Query()
+		writer.Header().Set("Content-Type", "application/json")
+		body := `{"objects":{"object":[
+			{"attributes":{"attribute":[
+				{"name":"domain","value":"7.10.193.in-addr.arpa"},
+				{"name":"nserver","value":"ns1.example.com"}
+			]}},
+			{"attributes":{"attribute":[
+				{"name":"domain","value":"example.com"},
+				{"name":"nserver","value":"ns1.example.com"}
+			]}}
+		]}}`
+		if _, err := fmt.Fprint(writer, body); err != nil {
+			t.Errorf("could not write: %v", err)
+		}
+	})
+
+	prefixes, err := client.ReverseZones(t.Context(), "AA1-RIPE")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The forward zone names no prefix and is dropped rather than turned into one.
+	if !slices.Equal(prefixes, []string{"193.10.7.0/24"}) {
+		t.Errorf("expected the delegated block, got %v", prefixes)
+	}
+	if filters := asked["type-filter"]; !slices.Equal(filters, []string{TypeDomain}) {
+		t.Errorf("expected the delegations asked for, got %v", filters)
+	}
+}
+
+// TestAutNumsRipe holds the other object the same inverse search reaches: a number leads to the
+// prefixes a network authorises and announces, which the allocations do not cover.
+func TestAutNumsRipe(t *testing.T) {
+	t.Parallel()
+
+	client := serverClient(t, func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		body := `{"objects":{"object":[
+			{"attributes":{"attribute":[{"name":"aut-num","value":"AS64500"}]}},
+			{"attributes":{"attribute":[{"name":"aut-num","value":"as0064501"}]}}
+		]}}`
+		if _, err := fmt.Fprint(writer, body); err != nil {
+			t.Errorf("could not write: %v", err)
+		}
+	})
+
+	numbers, err := client.AutNums(t.Context(), "AA1-RIPE")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !slices.Equal(numbers, []string{"AS64500", "AS64501"}) {
+		t.Errorf("expected the numbers normalised, got %v", numbers)
+	}
+}
+
+func TestRoutePrefixesRipe(t *testing.T) {
+	t.Parallel()
+
+	client := serverClient(t, func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		body := `{"objects":{"object":[
+			{"attributes":{"attribute":[{"name":"route","value":"192.0.2.0/24"},{"name":"origin","value":"AS64500"}]}},
+			{"attributes":{"attribute":[{"name":"route6","value":"2001:db8::/32"},{"name":"origin","value":"AS64500"}]}}
+		]}}`
+		if _, err := fmt.Fprint(writer, body); err != nil {
+			t.Errorf("could not write: %v", err)
+		}
+	})
+
+	prefixes, err := client.RoutePrefixes(t.Context(), "AS64500")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !slices.Equal(prefixes, []string{"192.0.2.0/24", "2001:db8::/32"}) {
+		t.Errorf("expected both families, got %v", prefixes)
+	}
+}

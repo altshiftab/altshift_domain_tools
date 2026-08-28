@@ -3,10 +3,12 @@ package finder_config
 
 import (
 	"github.com/altshiftab/altshift_domain_tools/pkg/inference"
+	"github.com/altshiftab/altshift_domain_tools/pkg/network_range/reverse"
 	"github.com/altshiftab/altshift_domain_tools/pkg/network_range/spf"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/arin"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/rdap"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripe"
+	"github.com/altshiftab/altshift_domain_tools/pkg/sources/ripestat"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/whois"
 	"github.com/altshiftab/utils_go/pkg/http/types/fetch_config"
 )
@@ -30,8 +32,21 @@ type Config struct {
 	Whois map[inference.Method]*whois.Client
 	Rdap  map[inference.Method]*rdap.Client
 
+	// Ripestat answers what a party's networks authorise and announce. A nil one is built with its
+	// own defaults.
+	Ripestat *ripestat.Client
+
+	// MaxAutNums bounds how many of a party's networks are followed to their prefixes. Zero is the
+	// default.
+	MaxAutNums int
+
 	// Resolver is what the SPF walk asks. A nil one is net.DefaultResolver.
 	Resolver spf.Resolver
+
+	// ReverseResolver is what the reverse-delegation walk asks, which needs more of a resolver than
+	// the SPF walk does. A nil one is the Resolver where that answers these too, and otherwise
+	// net.DefaultResolver.
+	ReverseResolver reverse.Resolver
 
 	// FetchOptions are passed to the registry calls, on top of whatever the client was built with.
 	FetchOptions []fetch_config.Option
@@ -86,9 +101,27 @@ func WithRdap(method inference.Method, client *rdap.Client) Option {
 	}
 }
 
+func WithRipestat(client *ripestat.Client) Option {
+	return func(config *Config) {
+		config.Ripestat = client
+	}
+}
+
+func WithMaxAutNums(maxAutNums int) Option {
+	return func(config *Config) {
+		config.MaxAutNums = maxAutNums
+	}
+}
+
 func WithResolver(resolver spf.Resolver) Option {
 	return func(config *Config) {
 		config.Resolver = resolver
+	}
+}
+
+func WithReverseResolver(resolver reverse.Resolver) Option {
+	return func(config *Config) {
+		config.ReverseResolver = resolver
 	}
 }
 

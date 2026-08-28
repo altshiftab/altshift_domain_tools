@@ -28,6 +28,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/altshiftab/altshift_domain_tools/pkg/asn"
 	"github.com/altshiftab/altshift_domain_tools/pkg/cidr"
 	"github.com/altshiftab/altshift_domain_tools/pkg/email"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/arin/arin_config"
@@ -167,6 +168,14 @@ type (
 
 	networkRefs struct {
 		NetRef list[networkRef] `json:"netRef,omitzero"`
+	}
+
+	autNumsResponse struct {
+		Asns *autNumRefs `json:"asns,omitzero"`
+	}
+
+	autNumRefs struct {
+		AsnRef list[reference] `json:"asnRef,omitzero"`
 	}
 
 	networkRef struct {
@@ -552,6 +561,65 @@ func (client *Client) OrganizationPersons(
 	slices.Sort(handles)
 
 	return slices.Compact(handles), nil
+}
+
+// OrganizationAutNums returns the autonomous system numbers registered to the organisation.
+//
+// The same link as the allocations, followed to a different kind of resource. What the number is
+// worth is that it leads somewhere the registry does not: to the prefixes the network authorises
+// and announces, which are not the same set as the allocations.
+func (client *Client) OrganizationAutNums(
+	ctx context.Context,
+	handle string,
+	options ...fetch_config.Option,
+) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("context err: %w", err)
+	}
+
+	if client == nil {
+		return nil, altshiftErrors.NewWithTrace(nil_error.New("client"))
+	}
+
+	if handle == "" {
+		return nil, altshiftErrors.NewWithTrace(empty_error.New("handle"))
+	}
+
+	requestUrlString := client.objectUrl(OrganizationPath, handle, "asns")
+
+	_, response, err := altshiftHttpUtils.FetchJson[*autNumsResponse](
+		ctx,
+		requestUrlString,
+		client.fetchOptions(options)...,
+	)
+	if err != nil {
+		// An organisation holding no networks is answered with a 404 rather than an empty result.
+		if notFound(err) {
+			return []string{}, nil
+		}
+
+		return nil, altshiftErrors.New(fmt.Errorf("fetch json: %w", err), requestUrlString)
+	}
+
+	if response == nil || response.Asns == nil {
+		return []string{}, nil
+	}
+
+	numbers := make([]string, 0, len(response.Asns.AsnRef))
+
+	for _, hit := range response.Asns.AsnRef {
+		if hit == nil {
+			continue
+		}
+
+		if number := asn.Normalize(hit.Handle); number != "" {
+			numbers = append(numbers, number)
+		}
+	}
+
+	slices.Sort(numbers)
+
+	return slices.Compact(numbers), nil
 }
 
 // OrganizationRanges returns the allocations registered to the organisation.

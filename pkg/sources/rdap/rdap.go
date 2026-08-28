@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/altshiftab/altshift_domain_tools/pkg/asn"
 	"github.com/altshiftab/altshift_domain_tools/pkg/cidr"
 	"github.com/altshiftab/altshift_domain_tools/pkg/email"
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/rdap/rdap_config"
@@ -82,6 +83,9 @@ type Entity struct {
 	// Ranges are the allocations registered to it. A search answers without them; reading the party
 	// itself is what fills them in.
 	Ranges []*Range `json:"ranges,omitzero"`
+	// AutNums are the autonomous system numbers registered to it, which lead to the prefixes the
+	// networks authorise and announce -- a set the allocations do not cover.
+	AutNums []string `json:"aut_nums,omitzero"`
 }
 
 // Range is one registered allocation.
@@ -109,6 +113,13 @@ type (
 		// VcardArray is the contact card, in the two levels of array jCard wraps it in.
 		VcardArray []any      `json:"vcardArray,omitzero"`
 		Networks   []*network `json:"networks,omitzero"`
+		Autnums    []*autnum  `json:"autnums,omitzero"`
+	}
+
+	autnum struct {
+		Handle      string `json:"handle,omitzero"`
+		StartAutnum uint32 `json:"startAutnum,omitzero"`
+		EndAutnum   uint32 `json:"endAutnum,omitzero"`
 	}
 
 	network struct {
@@ -280,11 +291,12 @@ func convert(found *entity) (*Entity, error) {
 	}
 
 	converted := &Entity{
-		Handle: found.Handle,
-		Name:   vcardProperty(found.VcardArray, "fn"),
-		Kind:   strings.ToLower(vcardProperty(found.VcardArray, "kind")),
-		Email:  vcardProperty(found.VcardArray, "email"),
-		Ranges: make([]*Range, 0, len(found.Networks)),
+		Handle:  found.Handle,
+		Name:    vcardProperty(found.VcardArray, "fn"),
+		Kind:    strings.ToLower(vcardProperty(found.VcardArray, "kind")),
+		Email:   vcardProperty(found.VcardArray, "email"),
+		Ranges:  make([]*Range, 0, len(found.Networks)),
+		AutNums: autNums(found.Autnums),
 	}
 
 	for _, item := range found.Networks {
@@ -450,6 +462,33 @@ func (client *Client) Entity(
 	}
 
 	return converted, nil
+}
+
+// autNums reads the networks registered to a party.
+//
+// A block of them is written as a range of numbers, and only a block of one is a network somebody
+// holds -- a wider one is a registry's own reservation, which belongs to nobody in particular.
+func autNums(found []*autnum) []string {
+	numbers := make([]string, 0, len(found))
+
+	for _, item := range found {
+		if item == nil {
+			continue
+		}
+
+		number := asn.Normalize(item.Handle)
+		if number == "" && item.StartAutnum != 0 && item.StartAutnum == item.EndAutnum {
+			number = asn.FromNumber(item.StartAutnum)
+		}
+
+		if number != "" {
+			numbers = append(numbers, number)
+		}
+	}
+
+	slices.Sort(numbers)
+
+	return slices.Compact(numbers)
 }
 
 // organizationFirst sorts organisations before everything else.

@@ -18,6 +18,9 @@ What can be learned about a domain from outside it.
 | `pkg/sources/arin` | The same, for North America |
 | `pkg/sources/whois` | Inverse queries over port 43, for the registries with nothing better |
 | `pkg/sources/rdap` | Parties by name, for the same |
+| `pkg/sources/ripestat` | What a network authorises and announces |
+| `pkg/asn` | An autonomous system number, written the one way |
+| `pkg/network_range/reverse` | Whose reverse DNS is this block delegated to? |
 | `pkg/cidr` | An address range as the prefixes that cover it |
 | `pkg/email` | Is this registered address at the domain? |
 | `pkg/inference` | How something was found, and what that is worth |
@@ -112,9 +115,10 @@ rangeFinder := finder.NewFinder()
 ranges, err := rangeFinder.Find(ctx, "example.com")
 ```
 
-Four registries and a mail policy, run together. A registry knows what a party was *allocated*,
-including space it is not using; the domain's SPF record declares what it *sends from*, including
-space it uses under someone else's allocation. None is a superset of another.
+Four registries, the routing system and a mail policy, run together. A registry knows what a party
+was *allocated*, including space it is not using; the routing system knows what its networks
+*authorise and announce*, including space held under someone else's allocation; the domain's SPF
+record declares what it *sends from*. None is a superset of another.
 
 The SPF walk follows `include:` and `redirect:` only within the same registered domain. Without
 that, a domain whose record says `include:_spf.google.com` would contribute Google's entire mail
@@ -175,6 +179,86 @@ document out, with no status code, no content type and no length. What structure
 RPSL, and errors arrive in comments -- `%ERROR:101` for nothing found, which is an answer, against
 `%ERROR:105` for a refused query, which is not.
 
+### The other axis
+
+An allocation is what a party was *given*. A prefix is what its network *routes*, and space routed
+under someone else's allocation appears in no registry record a search would reach. So once a walk
+has found a party, it also asks what networks are registered to it -- `-i org -T aut-num`, or ARIN's
+`/asns`, or the `autnums` an RDAP party already answers with -- and follows each one to its prefixes
+three ways:
+
+| | What it asserts | Worth |
+| --- | --- | --- |
+| **RPKI authorisation** | The address holder *signing* that this network may originate the prefix | strong |
+| **Route object** | The registry's own version of the same statement, by the space's maintainer | strong |
+| **BGP announcement** | Observation: this is being routed by that network right now | fair |
+
+The last is deliberately worth less. A transit provider originates its customers' space, so an
+announcement alone attributes a customer's addresses to its provider -- it is evidence the prefix
+and the network belong together, not evidence of who holds the addresses.
+
+No further check is owed here, and that is the point of running it last: a network is only ever
+followed if it was registered to a contact or an organisation an earlier round had already checked
+against the domain, so the prefixes rest on exactly the evidence the allocations do.
+
+This axis is also global. The routing data covers every registry's space, which makes it the one
+route into the region no registry search here reaches.
+
+### Reverse delegation
+
+A registry hands a reverse zone to the holder of the address space and to nobody else. Getting
+`8.8.8.in-addr.arpa` answered by `ns1.google.com` is something only the party allocated `8.8.8.0/24`
+can arrange, so a delegation pointing into the domain is close to a statement of holding — and the
+zone name *is* the prefix, one label per octet.
+
+It is not a PTR. A reverse record says what an address is *called*, which whoever operates it
+decides: an address inside a provider's block is named by the provider, so a PTR reveals who runs
+the machine. The delegation is a level above and says who the block was handed to.
+
+It is asked two ways, because the fact is recorded in two places:
+
+- **In the registry.** RIPE, APNIC and AFRINIC keep the delegation as a `domain:` object with the
+  party's own contacts on it, so one more type filter on the inverse search already in use finds
+  them. No resolver involved.
+- **In the DNS.** `pkg/network_range/reverse` resolves the domain, then walks *up* from the most
+  specific zone until one answers — because the delegation sits at whatever boundary the holder
+  took, and nothing in an address says which. Google's is a `/24`, SUNET's a `/16`, Cloudflare's a
+  `/16`. The walk stops at the first zone that answers rather than climbing past it: the zone above
+  a party's is delegated to its provider, which is not evidence about this party. And *every*
+  nameserver must be within the domain, or a secondary somebody agreed to run would attribute a
+  block.
+
+Both are the same fact seen from two sides, so they share one method rather than corroborating each
+other into a higher score.
+
+### Held or used
+
+A party with an address inside a provider's block genuinely has that address, and does not hold the
+block. Both facts are worth having and they are not the same one, so a range carries a `Tenure`
+saying which the registry said it was:
+
+```
+185.133.68.0/22        held     ALLOCATED PA
+193.104.32.0/24        held     ASSIGNED PI
+2a05:2440::/29         held     ALLOCATED-BY-RIR
+77.88.104.0/29         used     ASSIGNED PA
+2a00:2381:112e::/56    used     ASSIGNED
+```
+
+The registries word it differently and mean the same thing: RIPE writes provider-aggregatable
+against provider-independent, APNIC and AFRINIC say portable and non-portable outright, and the v6
+statuses say whether the registry or a provider handed the space over -- `ALLOCATED-BY-LIR` opens
+like an allocation of the party's own and is the opposite of one.
+
+Most sources say nothing either way, and that is honest rather than missing: a routing announcement
+and a mail policy describe use, not title.
+
+The distinction matters most as a rule about what *not* to do. Attributing one address inside a
+provider's block is correct; treating that address as an anchor and taking the block around it would
+hand a customer its provider's entire estate -- the same mistake as following an SPF record into a
+mail provider. Excluding provider space outright would be the opposite error, throwing away an
+address the party really does have.
+
 `pkg/cidr` is what turns a registry's "first address - last address" into prefixes. An arbitrary
 range is not one prefix: `10.0.0.1 - 10.0.0.6` is a `/32`, a `/30` and a `/31`, and the alternative
 -- one prefix too large -- would attribute addresses the party does not hold. Both ends are host
@@ -194,6 +278,6 @@ would make co-location look like proof.
 
 ## Credentials
 
-`crtsh`, all four registries and the SPF walk need none. HackerTarget's host search is metered anonymously and
+`crtsh`, all four registries, the routing data and the SPF walk need none. HackerTarget's host search is metered anonymously and
 reports what is left of the allowance; its reverse IP lookup and WhoisXML both need keys, which are
 given to `related.NewFinder` rather than passed per call.
