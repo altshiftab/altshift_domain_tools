@@ -2,12 +2,14 @@ package crtsh
 
 import (
 	"encoding/json/v2"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"slices"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/crtsh/crtsh_config"
 	"github.com/altshiftab/utils_go/pkg/http/types/fetch_config"
@@ -202,5 +204,106 @@ func TestQueryRetries(t *testing.T) {
 				t.Errorf("got %d requests, expected %d", got, testCase.expectedCalls)
 			}
 		})
+	}
+}
+
+// slowServer answers after delay, or not at all if the request is given up on first.
+func slowServer(t *testing.T, delay *atomic.Int64, calls *atomic.Int32) *httptest.Server {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+
+		select {
+		case <-time.After(time.Duration(delay.Load())):
+		case <-request.Context().Done():
+			return
+		}
+
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`[]`))
+	}))
+	t.Cleanup(server.Close)
+
+	return server
+}
+
+func clientFor(t *testing.T, server *httptest.Server, httpClient *http.Client, options ...crtsh_config.Option) *Client {
+	t.Helper()
+
+	serverUrl, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("url parse: %v", err)
+	}
+
+	return NewClient(append([]crtsh_config.Option{
+		crtsh_config.WithBaseUrl(serverUrl),
+		crtsh_config.WithFetchOptions(fetch_config.WithHttpClient(httpClient)),
+	}, options...)...)
+}
+
+// TestQueryTakesItsOwnTimeout holds that a query is bounded by the client's timeout rather than by
+// that of a client the caller shares with faster sources: the monitor's thirty seconds cut crt.sh
+// off for domains with many certificates.
+func TestQueryTakesItsOwnTimeout(t *testing.T) {
+	t.Parallel()
+
+	var (
+		delay atomic.Int64
+		calls atomic.Int32
+	)
+	delay.Store(int64(200 * time.Millisecond))
+	server := slowServer(t, &delay, &calls)
+
+	callerClient := server.Client()
+	callerClient.Timeout = 50 * time.Millisecond
+
+	client := clientFor(t, server, callerClient, crtsh_config.WithRequestTimeout(2*time.Second))
+
+	if _, err := client.Query(t.Context(), "example.com"); err != nil {
+		t.Fatalf("expected the query to outlast the caller's timeout, got %v", err)
+	}
+}
+
+// TestQueryCoolsDownAfterATimeout holds the guard on that longer timeout: a timed-out query is not
+// retried, the queries that follow are turned away without a request until the cool-down is over,
+// and then they are made again.
+func TestQueryCoolsDownAfterATimeout(t *testing.T) {
+	t.Parallel()
+
+	var (
+		delay atomic.Int64
+		calls atomic.Int32
+	)
+	delay.Store(int64(time.Second))
+	server := slowServer(t, &delay, &calls)
+
+	client := clientFor(
+		t,
+		server,
+		server.Client(),
+		crtsh_config.WithRequestTimeout(100*time.Millisecond),
+		crtsh_config.WithTimeoutCooldown(300*time.Millisecond),
+	)
+
+	if _, err := client.Query(t.Context(), "example.com"); err == nil {
+		t.Fatal("expected the query to time out")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("got %d requests, expected a timed-out query not retried", got)
+	}
+
+	if _, err := client.Query(t.Context(), "example.org"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("expected the next query turned away, got %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("got %d requests, expected none while cooling down", got)
+	}
+
+	delay.Store(0)
+	time.Sleep(400 * time.Millisecond)
+
+	if _, err := client.Query(t.Context(), "example.net"); err != nil {
+		t.Fatalf("expected a query after the cool-down to be made, got %v", err)
 	}
 }
