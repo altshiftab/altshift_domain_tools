@@ -184,25 +184,97 @@ func (checker *Checker) Status(ctx context.Context, domain string) (Status, erro
 		return StatusUnknown, fmt.Errorf("read servers: %w", err)
 	}
 
-	topLevelDomain := domain[strings.LastIndex(domain, ".")+1:]
-
-	server, ok := servers[topLevelDomain]
+	server, ok := servers[topLevelDomainOf(domain)]
 	if !ok {
 		return checker.statusFromDns(ctx, domain)
 	}
 
-	lookupUrl := server.JoinPath("domain", domain).String()
-
-	if _, _, err := altshiftHttpUtils.FetchJson[any](ctx, lookupUrl, checker.fetchOptions()...); err != nil {
-		if statusError, ok := errors.AsType[*altshiftHttpErrors.Non2xxStatusCodeError](err); ok &&
-			statusError != nil && statusError.StatusCode == http.StatusNotFound {
-			return StatusUnregistered, nil
-		}
-
-		return StatusUnknown, altshiftErrors.New(fmt.Errorf("fetch json: %w", err), lookupUrl)
+	record, err := checker.lookup(ctx, server, domain)
+	if err != nil {
+		return StatusUnknown, fmt.Errorf("lookup: %w", err)
+	}
+	if record == nil {
+		return StatusUnregistered, nil
 	}
 
 	return StatusRegistered, nil
+}
+
+// ErrNoRdap is a domain whose registry runs no RDAP server, which is the only party that can say what
+// state the registration is in.
+var ErrNoRdap = errors.New("the registry runs no RDAP server")
+
+// ErrNotRegistered is a domain the registry does not hold.
+var ErrNotRegistered = errors.New("the domain is not registered")
+
+// domainRecord is the part of an RDAP domain object read here.
+type domainRecord struct {
+	// Status is the registration's states (RFC 9083), written as RFC 8056 maps the EPP codes: "client
+	// transfer prohibited" for clientTransferProhibited.
+	Status []string `json:"status"`
+}
+
+func topLevelDomainOf(domain string) string {
+	return domain[strings.LastIndex(domain, ".")+1:]
+}
+
+// lookup asks the registry for the domain. A domain the registry does not hold is nil and no error.
+func (checker *Checker) lookup(ctx context.Context, server *url.URL, domain string) (*domainRecord, error) {
+	lookupUrl := server.JoinPath("domain", domain).String()
+
+	_, record, err := altshiftHttpUtils.FetchJson[*domainRecord](ctx, lookupUrl, checker.fetchOptions()...)
+	if err != nil {
+		if statusError, ok := errors.AsType[*altshiftHttpErrors.Non2xxStatusCodeError](err); ok &&
+			statusError != nil && statusError.StatusCode == http.StatusNotFound {
+			return nil, nil
+		}
+
+		return nil, altshiftErrors.New(fmt.Errorf("fetch json: %w", err), lookupUrl)
+	}
+	if record == nil {
+		return &domainRecord{}, nil
+	}
+
+	return record, nil
+}
+
+// Statuses returns the states the registry records the domain in -- the locks against transfer,
+// update and deletion among them -- as the registry writes them. A domain whose registry runs no RDAP
+// server is ErrNoRdap, and one the registry does not hold is ErrNotRegistered: neither has states to
+// read, and the DNS cannot supply them.
+func (checker *Checker) Statuses(ctx context.Context, domain string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("context err: %w", err)
+	}
+
+	if checker == nil {
+		return nil, altshiftErrors.NewWithTrace(nil_error.New("checker"))
+	}
+
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+	if domain == "" {
+		return nil, altshiftErrors.NewWithTrace(empty_error.New("domain"))
+	}
+
+	servers, err := checker.readServers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read servers: %w", err)
+	}
+
+	server, ok := servers[topLevelDomainOf(domain)]
+	if !ok {
+		return nil, altshiftErrors.NewWithTrace(ErrNoRdap, domain)
+	}
+
+	record, err := checker.lookup(ctx, server, domain)
+	if err != nil {
+		return nil, fmt.Errorf("lookup: %w", err)
+	}
+	if record == nil {
+		return nil, altshiftErrors.NewWithTrace(ErrNotRegistered, domain)
+	}
+
+	return record.Status, nil
 }
 
 // statusFromDns answers for a domain whose registry runs no RDAP server.

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -45,7 +46,7 @@ func newServer(t *testing.T, bootstrapStatus *atomic.Int32) *httptest.Server {
 			_, _ = writer.Write([]byte(`{"services":[[["com","net"],["` + server.URL + `/com/v1"]]]}`))
 		case request.URL.Path == "/com/v1/domain/registered.com":
 			writer.Header().Set("Content-Type", ContentType)
-			_, _ = writer.Write([]byte(`{"objectClassName":"domain","ldhName":"registered.com"}`))
+			_, _ = writer.Write([]byte(`{"objectClassName":"domain","ldhName":"registered.com","status":["active","client transfer prohibited","server delete prohibited"]}`))
 		case request.URL.Path == "/com/v1/domain/lapsed.com":
 			writer.WriteHeader(http.StatusNotFound)
 		case strings.HasPrefix(request.URL.Path, "/com/v1/domain/"):
@@ -161,5 +162,57 @@ func TestStatusRetriesTheBootstrap(t *testing.T) {
 	}
 	if status != StatusUnregistered {
 		t.Errorf("got %s, expected %s", status, StatusUnregistered)
+	}
+}
+
+func TestStatuses(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name        string
+		domain      string
+		expected    []string
+		expectedErr error
+		expectErr   bool
+	}{
+		{
+			name:     "the registry's states",
+			domain:   "registered.com",
+			expected: []string{"active", "client transfer prohibited", "server delete prohibited"},
+		},
+		{name: "a domain nobody holds", domain: "lapsed.com", expectedErr: ErrNotRegistered},
+		// The DNS can say a name exists but not what state its registration is in.
+		{name: "a registry with no RDAP server", domain: "kivra.se", expectedErr: ErrNoRdap},
+		{name: "the registry cannot be asked", domain: "throttled.com", expectErr: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			bootstrapStatus := &atomic.Int32{}
+			bootstrapStatus.Store(http.StatusOK)
+
+			domainResolver := &fakeResolver{exists: true}
+			checker := newChecker(t, newServer(t, bootstrapStatus), domainResolver)
+
+			statuses, err := checker.Statuses(t.Context(), testCase.domain)
+
+			if testCase.expectedErr != nil {
+				if !errors.Is(err, testCase.expectedErr) {
+					t.Fatalf("got error %v, expected %v", err, testCase.expectedErr)
+				}
+				return
+			}
+			if (err != nil) != testCase.expectErr {
+				t.Fatalf("got error %v, expected an error: %v", err, testCase.expectErr)
+			}
+			if !slices.Equal(statuses, testCase.expected) {
+				t.Errorf("got %v, expected %v", statuses, testCase.expected)
+			}
+			if domainResolver.calls.Load() != 0 {
+				t.Error("expected the DNS not asked for states")
+			}
+		})
 	}
 }
