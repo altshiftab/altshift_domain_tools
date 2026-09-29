@@ -15,11 +15,13 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/crtsh/crtsh_config"
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 	"github.com/altshiftab/utils_go/pkg/errors/types/nil_error"
 	"github.com/altshiftab/utils_go/pkg/http/types/fetch_config"
+	"github.com/altshiftab/utils_go/pkg/http/types/fetch_config/retry_config"
 	altshiftHttpUtils "github.com/altshiftab/utils_go/pkg/http/utils"
 )
 
@@ -62,6 +64,24 @@ func NewClient(options ...crtsh_config.Option) *Client {
 	return &Client{baseUrl: &clientUrl, config: config}
 }
 
+// The retries a query gets. crt.sh is a shared public service that answers a busy moment with a 429,
+// a 502 or no answer in time, and a query refused once is usually answered a little later.
+const (
+	RetryCount       = 3
+	RetryBaseDelay   = 5 * time.Second
+	MaximumRetryWait = time.Minute
+)
+
+// defaultRetryConfig retries what the standard checker does -- a 429, a server error, no response
+// at all -- after the wait crt.sh advises or a back-off from RetryBaseDelay.
+func defaultRetryConfig() *retry_config.Config {
+	return retry_config.New(
+		retry_config.WithCount(RetryCount),
+		retry_config.WithBaseDelay(RetryBaseDelay),
+		retry_config.WithMaximumWaitTime(MaximumRetryWait),
+	)
+}
+
 // Query returns the certificates the logs hold for the domain and its subdomains.
 func (client *Client) Query(
 	ctx context.Context,
@@ -94,7 +114,13 @@ func (client *Client) Query(
 	// slices.Concat rather than append: the client's options are shared by every call, and
 	// appending into that slice's spare capacity would have concurrent calls overwrite one
 	// another's.
-	fetchOptions := slices.Concat(client.config.FetchOptions, options)
+	//
+	// Retries first, so that a caller's own retry policy replaces them.
+	fetchOptions := slices.Concat(
+		[]fetch_config.Option{fetch_config.WithRetryConfig(defaultRetryConfig())},
+		client.config.FetchOptions,
+		options,
+	)
 
 	_, results, err := altshiftHttpUtils.FetchJson[[]*Result](ctx, requestUrlString, fetchOptions...)
 	if err != nil {

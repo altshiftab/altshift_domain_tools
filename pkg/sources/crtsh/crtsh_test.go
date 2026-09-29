@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"sync/atomic"
 	"testing"
 
 	"github.com/altshiftab/altshift_domain_tools/pkg/sources/crtsh/crtsh_config"
@@ -154,5 +155,52 @@ func TestQueryArgumentChecks(t *testing.T) {
 	}
 	if results != nil {
 		t.Errorf("expected an empty domain to search nothing, got %d", len(results))
+	}
+}
+
+// TestQueryRetries holds that a query crt.sh turns away for being busy is made again once the wait it
+// advises is over, and that one it answers for good -- a 404 -- is not.
+func TestQueryRetries(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name          string
+		first         int
+		expectErr     bool
+		expectedCalls int32
+	}{
+		{name: "busy, then answered", first: http.StatusTooManyRequests, expectedCalls: 2},
+		{name: "a server error, then answered", first: http.StatusBadGateway, expectedCalls: 2},
+		{name: "not found is an answer", first: http.StatusNotFound, expectErr: true, expectedCalls: 1},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				if calls.Add(1) == 1 {
+					// The shortest wait the header can advise, so the test is not slow.
+					writer.Header().Set("Retry-After", "0")
+					writer.WriteHeader(testCase.first)
+
+					return
+				}
+
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = writer.Write([]byte(`[]`))
+			}))
+			t.Cleanup(server.Close)
+
+			_, err := serverClient(t, server).Query(t.Context(), "example.com")
+			if (err != nil) != testCase.expectErr {
+				t.Fatalf("got error %v, expected an error: %v", err, testCase.expectErr)
+			}
+
+			if got := calls.Load(); got != testCase.expectedCalls {
+				t.Errorf("got %d requests, expected %d", got, testCase.expectedCalls)
+			}
+		})
 	}
 }
