@@ -112,7 +112,7 @@ func defaultRetryConfig() *retry_config.Config {
 		retry_config.WithBaseDelay(RetryBaseDelay),
 		retry_config.WithMaximumWaitTime(MaximumRetryWait),
 		retry_config.WithResponseChecker(response_checker.New(
-			func(response *http.Response, err error) bool {
+			func(response *http.Response, _ []byte, err error) bool {
 				if response != nil {
 					return response.StatusCode == http.StatusTooManyRequests ||
 						response.StatusCode >= http.StatusInternalServerError
